@@ -11,7 +11,7 @@ Requirements (each GREEN / AMBER / RED with the exact missing field and a fix po
   R7 tool args and results     R8 tool success/error status   R9 token usage (cost)
   R10 model name (cost via prices)                            R11 volume (>= 30 runs recommended)
 Thresholds: GREEN >= 90% of runs (or tool calls) have the field, AMBER > 0%, RED none.
-Verdict: NOT_READY if any of R1, R3, R4, R5 is RED (or no runs); READY if everything is GREEN;
+Verdict: NOT_READY only when no runs could be built; READY if everything is GREEN;
 otherwise USABLE_WITH_GAPS. Message contents are shown only as <= 80 char redacted examples.
 """
 import argparse
@@ -24,7 +24,7 @@ from common import add_ingest_args, short, write_json  # noqa: E402
 import normalize as N  # noqa: E402
 
 GREEN, AMBER, RED = "GREEN", "AMBER", "RED"
-CRITICAL = ("R1", "R3", "R4", "R5")
+CRITICAL = ()  # degrade, never block: gaps shrink the analysis (see cleaning_report.md), they do not stop it
 DOC = "references/data-gaps.md#"
 RUN_ID_GOOD = ("call_id", "call_id_ancestor", "call_id_trace", "langsmith_trace")
 
@@ -57,7 +57,7 @@ def evaluate(runs, spans, stats, opts):
         st, miss = RED, "no runs could be built"
     elif good >= 0.9 * n:
         st, miss = GREEN, ""
-    elif src["trace_id"] + src["conversation_turn"] >= 0.5 * n:
+    elif src["trace_id"] + src["conversation_turn"] + src["time_containment"] + src["conversation"] >= 0.5 * n:
         st = AMBER
         miss = ("gen_ai.agent.call.id missing on %d%% of runs; falling back to %s (a trace holding several turns "
                 "would merge into one run)" % (round(_pct(n - good, n)), "trace_id / conversation turns"))
@@ -79,17 +79,20 @@ def evaluate(runs, spans, stats, opts):
     timed = sum(1 for r in runs if r["latency_s"] and r["latency_s"] > 0)
     st = _grade(timed / n if n else 0, n)
     reqs.append(_req("R3", "timestamps (latency)", st, "%d of %d runs have a measurable latency" % (timed, n),
-                     "start/end timestamps or duration missing (accepted: %s; durations: duration, duration_ms)" %
+                     "start/end timestamps or duration missing: the latency dimension is dropped, cost/errors/score are kept "
+                     "(accepted: %s; durations: duration, duration_ms)" %
                      ", ".join(N.F["start"][:4] + N.F["end"][:2]), "timestamps"))
 
     # R4 / R5
     hu = sum(1 for r in runs if r["user_message"])
     ha = sum(1 for r in runs if r["final_answer"])
     reqs.append(_req("R4", "user message text", _grade(hu / n if n else 0, n), "%d of %d runs have the user message" % (hu, n),
-                     "no user message found (accepted: %s, or input events gen_ai.user.message)" %
+                     "no user message found: those runs are marked thin and graded on what exists "
+                     "(accepted: %s, or input events gen_ai.user.message)" %
                      ", ".join(N.F["in_msgs"][:3]), "message-content"))
     reqs.append(_req("R5", "final answer text", _grade(ha / n if n else 0, n), "%d of %d runs have a final answer" % (ha, n),
-                     "no assistant answer found (accepted: %s, final_result, or events gen_ai.choice)" %
+                     "no assistant answer found: those runs are marked thin and graded on what exists "
+                     "(accepted: %s, final_result, or events gen_ai.choice)" %
                      ", ".join(N.F["out_msgs"][:3]), "message-content"))
 
     # R6 / R7 / R8
@@ -127,7 +130,7 @@ def evaluate(runs, spans, stats, opts):
     # R9 / R10
     tk = sum(1 for r in runs if (r["input_tokens"] or r["output_tokens"]))
     reqs.append(_req("R9", "token usage (cost)", _grade(tk / n if n else 0, n), "%d of %d runs have token counts" % (tk, n),
-                     "no token usage (accepted: %s / %s)" % (", ".join(N.F["itok"][:2]), ", ".join(N.F["otok"][:2])),
+                     "no token usage: tokens are estimated as chars/4 and flagged estimated (accepted: %s / %s)" % (", ".join(N.F["itok"][:2]), ", ".join(N.F["otok"][:2])),
                      "token-usage"))
     models = Counter(m for r in runs for m in r["models"])
     has_cost = sum(1 for r in runs if r["cost_usd"] is not None)
@@ -156,7 +159,7 @@ def evaluate(runs, spans, stats, opts):
 
 
 def verdict_of(reqs, n):
-    if n == 0 or any(r["status"] == RED for r in reqs if r["id"] in CRITICAL):
+    if n == 0:
         return "NOT_READY"
     return "READY" if all(r["status"] == GREEN for r in reqs) else "USABLE_WITH_GAPS"
 
@@ -188,22 +191,7 @@ def to_markdown(rep):
     return "\n".join(L) + "\n"
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(prog="plite inspect", description="check that trace logs are sufficient")
-    add_ingest_args(p)
-    a = p.parse_args(argv)
-    try:
-        opts = N.opts_from_args(a)
-        runs, spans, stats = N.run_all(a.src, opts)
-    except (FileNotFoundError, ValueError) as e:
-        print("error: %s" % e, file=sys.stderr)
-        return 2
-    except SystemExit as e:
-        print("error: %s" % e, file=sys.stderr)
-        return 2
-    if stats["records"] == 0:
-        print("error: the sources contain no records", file=sys.stderr)
-        return 2
+def build_report(runs, spans, stats, opts):
     reqs, models = evaluate(runs, spans, stats, opts)
     n = len(runs)
     ex = {}
@@ -220,7 +208,7 @@ def main(argv=None):
     rep = {
         "verdict": verdict_of(reqs, n),
         "formats": dict(stats["formats"]),
-        "files": stats["files"],
+        "files": [os.path.basename(f) for f in stats.get("files", [])],
         "counts": {"records": stats["records"], "spans": len(spans), "runs": n,
                    "conversations": len({r["conversation_id"] for r in runs}),
                    "tool_calls": sum(len(r["tool_calls"]) for r in runs),
@@ -232,14 +220,39 @@ def main(argv=None):
         "columns_seen": [k for k, _ in stats["columns"].most_common(40)],
     }
     if n == 0:
-        rep["fix_list"].insert(0, "No runs could be built (formats seen: %s). If this is a flat table, write a "
-                                  "mapping file (templates/mapping.example.json) and pass --map; see "
-                                  "references/data-gaps.md#flat-tables" % (rep["formats"] or "none"))
-    os.makedirs(a.out, exist_ok=True)
-    write_json(os.path.join(a.out, "inspect.json"), rep)
-    with open(os.path.join(a.out, "inspect.md"), "w", encoding="utf-8") as f:
+        rep["fix_list"].insert(0, stats.get("mapping_failed") or (
+            "No runs could be built (formats seen: %s). Write a mapping file (templates/mapping.example.json) "
+            "and pass --map; see references/data-gaps.md#flat-tables" % (rep["formats"] or "none")))
+    return rep
+
+
+def write_report(out, rep):
+    os.makedirs(out, exist_ok=True)
+    write_json(os.path.join(out, "inspect.json"), rep)
+    with open(os.path.join(out, "inspect.md"), "w", encoding="utf-8") as f:
         f.write(to_markdown(rep))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="plite inspect", description="check that trace logs are sufficient")
+    add_ingest_args(p)
+    a = p.parse_args(argv)
+    try:
+        opts = N.opts_from_args(a)
+        runs, spans, stats = N.run_all(a.src, opts)
+    except (FileNotFoundError, ValueError) as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 2
+    except SystemExit as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 2
+    if stats["records"] == 0:
+        print("error: the sources contain no readable records (empty, binary, or not JSON/CSV)", file=sys.stderr)
+        return 2
+    rep = build_report(runs, spans, stats, opts)
+    write_report(a.out, rep)
     c = rep["counts"]
+    reqs = rep["requirements"]
     print("verdict: %s | %d runs, %d conversations, %d tool calls (%d spans, %d noise dropped)" % (
         rep["verdict"], c["runs"], c["conversations"], c["tool_calls"], c["spans"], c["noise_spans_dropped"]))
     for r in reqs:

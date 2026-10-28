@@ -20,12 +20,14 @@ claude plugin marketplace add <repo path or git url>
 claude plugin install procept-lite@procept-marketplace
 ```
 
-## Quickstart
+## Quickstart (one action)
 
-1. Run `/procept-lite:start` (or just ask "why is my agent failing?" with your trace export at hand).
-2. The skill explains the idea, tells you how to export traces from your platform, and checks the files (`/procept-lite:check`).
-3. It estimates grading cost and asks before spending, then grades runs with Haiku agents (`/procept-lite:grade`).
-4. It builds the network (`/procept-lite:build`) and the scorecard (`/procept-lite:report`).
+1. Export your agent logs (any platform, any format; walkthroughs in `skills/procept-lite/references/exports/`).
+2. Tell Claude "build the CIG" or run `/procept-lite:start <path>`.
+
+Claude states a two-sentence plan (it only transforms static files locally and changes nothing in your systems), cleans and maps the data, grades a stratified sample of up to 300 runs with Haiku agents (configurable; cost stated up front), and builds the CIG, viewer and report. No further questions unless it is truly blocked.
+
+Degrade, never block: missing timestamps drop latency, missing tokens are estimated, missing error fields are derived from result text, dirty or unknown formats are cleaned and auto-mapped. Every repair and drop is listed in `cleaning_report.md`; see `skills/procept-lite/references/exceptions.md`.
 
 Script directly: `python3 plugins/procept-lite/scripts/plite.py <inspect|normalize|grade-prepare|grade-merge|cig|viewer|report|run> --out ./procept-out`.
 
@@ -34,6 +36,8 @@ Script directly: `python3 plugins/procept-lite/scripts/plite.py <inspect|normali
 | File | Content |
 |---|---|
 | `inspect.md`, `inspect.json` | GREEN/AMBER/RED data sufficiency check |
+| `cleaning_report.md` | every repair, drop, estimate and assumption, with counts |
+| `mapping.auto.json` | auto-scaffolded field mapping (if the schema was unknown) |
 | `normalized/runs.jsonl` | one canonical dossier per run |
 | `grading/` | shards, brief, per-shard scores, audit |
 | `scores.csv` | outcome_score (1/0/-1), confidence, rationale, persona, issue per run |
@@ -43,14 +47,18 @@ Script directly: `python3 plugins/procept-lite/scripts/plite.py <inspect|normali
 
 ## Data requirements
 
-| Need | Used for | If missing |
-|---|---|---|
-| Run id (agent call id or root trace id) | unit of analysis | derived from trace id, lower fidelity |
-| Conversation / session / thread id | grouping runs | each run treated as its own conversation |
-| Timestamps | latency, ordering | latency unavailable |
-| User message and final answer | grading | RED, cannot grade |
-| Tool calls with args and results | network, errors | AMBER, no tool graph |
-| Tokens and/or prices | cost | cost reported in tokens only |
+None are hard blockers. Missing pieces degrade the output and are reported:
+
+| Missing | Effect |
+|---|---|
+| Timestamps | latency dimension dropped |
+| Tokens / cost | tokens estimated (chars/4, flagged); dollars need prices |
+| Error field | errors derived from result text and status |
+| Tool calls | scorecard only; CIG has just an agent node |
+| Run / conversation id | synthesized (hash; session, trace, or time gap) |
+| User message or answer | best available text; run marked "thin" |
+
+Only an empty or unreadable input stops the pipeline, with a one-line message.
 
 ## Limits
 

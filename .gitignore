@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 procept-out/
 .DS_Store
+tests/fuzz/**
+!tests/fuzz/*/
+!tests/fuzz/*/gen.py

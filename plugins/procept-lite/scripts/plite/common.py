@@ -5,7 +5,6 @@ directories, streamed), timestamp parsing, text extraction from the many chat-me
 agent traces, redaction and clipping helpers.
 """
 import csv
-import gzip
 import json
 import os
 import re
@@ -23,13 +22,114 @@ EXTS = (".json", ".jsonl", ".ndjson", ".csv", ".tsv")
 # ---------------------------------------------------------------- small utils
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-SECRET_RE = re.compile(r"\b(?:sk|pk|rk|ghp|gho|xox[bpa])[-_][A-Za-z0-9_\-]{16,}|\bBearer\s+[A-Za-z0-9._\-]{16,}")
+SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk|pk|rk|ghp|gho|xox[bpa])[-_][A-Za-z0-9_\-]{16,}|\bBearer\s+[A-Za-z0-9._~+/\-]{6,}=*"
+    r"|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|(?i:\b(?:password|passwd|pwd|pw|pass|secret|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|client[_-]?secret)\b"
+    r"[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}&]{4,}")
+
+
+CARD_RE = re.compile(r"(?<![\d.])\d(?:[ -]?\d){12,18}(?![\d.])")
+
+
+def _luhn(digits):
+    tot, alt = 0, False
+    for ch in reversed(digits):
+        d = int(ch)
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        tot += d
+        alt = not alt
+    return tot % 10 == 0
+
+
+def _card_sub(m):
+    digits = re.sub(r"\D", "", m.group(0))
+    return "[card]" if 13 <= len(digits) <= 19 and _luhn(digits) else m.group(0)
+
+
+def redact_secrets(s):
+    """Replace API tokens / passwords / card numbers (not e-mails) with placeholders."""
+    if not (isinstance(s, str) and s):
+        return s
+    return CARD_RE.sub(_card_sub, SECRET_RE.sub("[secret]", s))
 
 
 def redact(s):
-    """Replace e-mail addresses and obvious API tokens with placeholders."""
-    s = EMAIL_RE.sub("[email]", str(s))
-    return SECRET_RE.sub("[secret]", s)
+    """Replace e-mail addresses, API tokens, passwords and card numbers with placeholders."""
+    return redact_secrets(EMAIL_RE.sub("[email]", str(s)))
+
+
+# ---------------------------------------------------------------- sanitising (surrogates, control chars, depth)
+
+_CTRL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_SURR_RE = re.compile("[\ud800-\udfff]")
+MAX_STR = 400000
+MAX_DEPTH = 60
+
+
+def clean_text(s):
+    """Remove lone surrogates / NUL / control characters; returns (text, changed)."""
+    ch = False
+    if _SURR_RE.search(s):
+        s, ch = _SURR_RE.sub("\ufffd", s), True
+    if _CTRL_RE.search(s):
+        s, ch = _CTRL_RE.sub("", s), True
+    return s, ch
+
+
+def sanitize(o, _d=0, _st=None):
+    """Return a copy of a parsed JSON value that is safe to write and process: strings cleaned, NaN/inf -> None,
+    nesting deeper than MAX_DEPTH cut, giant strings clipped. Counters are noted in the cleaning ledger."""
+    import cleaning as CL
+    st = _st if _st is not None else {"text": 0, "deep": 0, "nan": 0, "big": 0}
+    top = _st is None
+    if isinstance(o, str):
+        if len(o) > MAX_STR:
+            o = o[:MAX_STR]
+            st["big"] += 1
+        o, ch = clean_text(o)
+        st["text"] += ch
+        r = o
+    elif isinstance(o, float):
+        if o != o or o in (float("inf"), float("-inf")):
+            st["nan"] += 1
+            r = None
+        else:
+            r = o
+    elif isinstance(o, dict):
+        if _d >= MAX_DEPTH:
+            st["deep"] += 1
+            r = None
+        else:
+            r = {}
+            for k, v in o.items():
+                if isinstance(k, str):
+                    k, ch = clean_text(k)
+                    st["text"] += ch
+                r[k] = sanitize(v, _d + 1, st)
+    elif isinstance(o, list):
+        if _d >= MAX_DEPTH:
+            st["deep"] += 1
+            r = None
+        else:
+            r = [sanitize(v, _d + 1, st) for v in o]
+    else:
+        r = o
+    if top:
+        CL.note("text_sanitized", st["text"])
+        CL.note("deep_nesting_truncated", st["deep"])
+        CL.note("nan_to_null", st["nan"])
+        CL.note("field_truncated", st["big"], "text over %d characters" % MAX_STR)
+    return r
+
+
+def safe_str(s):
+    """A string that can always be encoded as UTF-8."""
+    return clean_text(s)[0] if isinstance(s, str) else s
 
 
 def clip(s, n):
@@ -62,29 +162,97 @@ def pick(d, keys):
     return None
 
 
+def _py_literal(t):
+    """Python repr of a dict/list (single quotes, None/True/False) -> value, or None."""
+    if len(t) > 2000000 or not (t[:1] in "{[" and t[-1:] in "}]"):
+        return None
+    if "'" not in t and "None" not in t and "True" not in t and "False" not in t:
+        return None
+    import ast
+    try:
+        v = ast.literal_eval(t)
+    except (ValueError, SyntaxError, MemoryError, RecursionError, TypeError):
+        return None
+    return v if isinstance(v, (dict, list)) else None
+
+
+def _pint(s):
+    return int(s) if len(s) <= 30 else None
+
+
+def loads_safe(t):
+    """json.loads that tolerates NaN/Infinity, huge ints and deep nesting. Raises ValueError on bad JSON."""
+    try:
+        return json.loads(t, parse_int=_pint, parse_constant=lambda c: None)
+    except RecursionError:
+        raise ValueError("too deeply nested")
+
+
 def jloads(v):
-    """Parse v if it is a JSON object/array in a string, else return it unchanged."""
+    """Parse v if it is a JSON (or Python-repr) object/array in a string, else return it unchanged."""
     if isinstance(v, str):
-        t = v.lstrip()
+        t = v.strip()
         if t[:1] in ("{", "["):
             try:
-                return json.loads(t)
+                return loads_safe(t)
+            except ValueError:
+                r = _py_literal(t)
+                return v if r is None else r
+        if t[:2] in ('"{', '"[') and t[-1:] == '"':  # double-encoded
+            try:
+                inner = loads_safe(t)
             except ValueError:
                 return v
+            return jloads(inner) if isinstance(inner, str) else v
     return v
 
 
 def to_int(v):
     try:
+        if isinstance(v, str):
+            v = re.sub(r"(?<=\d)[\s_,\u00a0\u202f](?=\d{3}\b)", "", v.strip()).replace(",", "")
         return int(float(v))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+TOKEN_MAX = 50000000
+
+
+def to_tokens(v):
+    """Token count from a number/string; negative, absurd or non-numeric values are rejected (0) and logged."""
+    if v is None or v in MISSING or isinstance(v, bool):
+        return 0
+    n = to_int(v)
+    if n < 0 or n > TOKEN_MAX:
+        import cleaning as CL
+        CL.note("implausible_tokens")
+        return 0
+    return n
+
+
+DUR_MAX = 31 * 86400.0
+
+
+def ok_dur(d):
+    """Duration in seconds, or None (logged) when negative or longer than a month."""
+    if d is None:
+        return None
+    if d < 0 or d > DUR_MAX:
+        import cleaning as CL
+        CL.note("implausible_duration")
+        return None
+    return d
 
 
 def to_float(v):
     try:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, str):
+            v = re.sub(r"(?<=\d)[\s_,\u00a0\u202f](?=\d{3}\b)", "", v.strip().lstrip("$\u20ac\u00a3 ")).replace(",", "")
         f = float(v)
-        return f if f == f else None
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
     except (TypeError, ValueError):
         return None
 
@@ -106,7 +274,27 @@ _TS_RE = re.compile(
     r"^\s*(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:[.,](\d+))?\s*(Z|UTC|[+-]\d\d(?::?\d\d)?)?\s*$")
 
 
-def to_epoch(v, fmt=None):
+TS_MIN, TS_MAX = 946684800.0, 4102444800.0  # 2000-01-01 .. 2100-01-01
+
+
+def to_epoch(v, fmt=None, note=True):
+    """Seconds since epoch (float) or None; values outside 2000..2100 (epoch 0, year 1, year 9999) are missing.
+    See _to_epoch for the accepted forms."""
+    r = _to_epoch(v, fmt)
+    if r is None:
+        if note and v not in MISSING and not (isinstance(v, str) and not v.strip()) and not isinstance(v, bool):
+            import cleaning as CL
+            CL.note("bad_timestamp")
+        return None
+    if not (TS_MIN <= r <= TS_MAX):
+        if note:
+            import cleaning as CL
+            CL.note("implausible_timestamp")
+        return None
+    return r
+
+
+def _to_epoch(v, fmt=None):
     """Seconds since epoch (float) or None. Accepts ISO 8601 / 'YYYY-MM-DD HH:MM:SS.ffffff+00' (naive = UTC),
     numbers in s / ms / us / ns (auto-detected by magnitude) and datetime."""
     if v in MISSING:
@@ -117,13 +305,18 @@ def to_epoch(v, fmt=None):
         return None
     if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").replace(".", "", 1).isdigit()):
         n = float(v)
+        if n != n or n in (float("inf"), float("-inf")):
+            return None
         a = abs(n)
-        if a >= 1e17:
-            return n / 1e9
-        if a >= 1e14:
-            return n / 1e6
         if a >= 1e11:
-            return n / 1e3
+            import cleaning as CL
+            CL.note("epoch_units_normalized")
+        if a >= 1e17:
+            n = n / 1e9
+        elif a >= 1e14:
+            n = n / 1e6
+        elif a >= 1e11:
+            n = n / 1e3
         return n
     if not isinstance(v, str):
         return None
@@ -135,7 +328,7 @@ def to_epoch(v, fmt=None):
             return None
     m = _TS_RE.match(v)
     if not m:
-        return None
+        return _loose_epoch(v)
     y, mo, d, h, mi, s, frac, tz = m.groups()
     try:
         base = datetime(int(y), int(mo), int(d), int(h), int(mi), int(s), tzinfo=timezone.utc).timestamp()
@@ -151,16 +344,68 @@ def to_epoch(v, fmt=None):
     return base
 
 
+_LOOSE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+                  "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d %b %Y %H:%M:%S",
+                  "%b %d, %Y %I:%M:%S %p", "%a, %d %b %Y %H:%M:%S %z", "%a %b %d %H:%M:%S %Y",
+                  "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z", "%Y%m%dT%H%M%SZ", "%a, %d %b %Y %H:%M:%S",
+                  "%d %b %Y", "%b %d %Y", "%Y.%m.%d %H:%M:%S", "%d.%m.%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+                  "%Y-%m-%d %I:%M:%S %p", "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y", "%Y/%m/%d")
+
+
+def _loose_epoch(v):
+    t = v.strip()
+    if not t or len(t) > 64:
+        return None
+    t = re.sub(r"\s*\(?(UTC|GMT)\)?$", "", t)
+    for fmt in _LOOSE_FORMATS:
+        try:
+            d = datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+    try:
+        d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        return None
+
+
 def iso(ts):
     if ts is None:
         return None
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+_DUR_RE = re.compile(r"^\s*(-?\d+(?:[.,]\d+)?)\s*(ns|nanos?|nanoseconds?|us|\u00b5s|micros?|microseconds?|ms|msecs?|"
+                     r"millis?|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\s*$", re.I)
+_DUR_MULT = {"ns": 1e-9, "us": 1e-6, "\u00b5s": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _dur_suffix(v):
+    """'1.2s' / '350ms' / '2 min' -> seconds, else None."""
+    if not isinstance(v, str):
+        return None
+    m = _DUR_RE.match(v)
+    if not m:
+        return None
+    u = m.group(2).lower()
+    key = "ns" if u.startswith("nano") else "us" if u.startswith(("micro", "\u00b5")) or u == "us" else \
+        "ms" if u.startswith(("ms", "milli")) else "h" if u.startswith("h") else \
+        "m" if u.startswith("m") else "s"
+    return float(m.group(1).replace(",", ".")) * _DUR_MULT[key]
 
 
 def parse_duration_s(v, unit="s"):
-    """Duration in seconds from a number, numeric string or 'HH:MM:SS.fff'. unit in s|ms|us|ns."""
+    """Duration in seconds from a number, numeric string, '1.2s'/'350ms'/'2 min' or 'HH:MM:SS.fff'.
+    unit in s|ms|us|ns applies to bare numbers."""
     if v in MISSING:
         return None
+    sfx = _dur_suffix(v)
+    if sfx is not None:
+        return sfx
     if isinstance(v, str) and ":" in v:
         try:
             parts = [float(x) for x in v.strip().split(":")]
@@ -316,61 +561,58 @@ def find_key(obj, keys, depth=6):
     return None
 
 
-# ---------------------------------------------------------------- record readers
+_ERR_NULLS = {"", "n/a", "na", "none", "null", "nil", "false", "0", "no", "ok", "{}", "[]", "nan", "-", "--",
+              "undefined", "success", "succeeded", "passed", "0.0", "false.", "no error", "no errors", "empty", "ok."}
+
+
+def is_error_literal(v):
+    """True for values that mean 'no error' (None, N/A, false, 0, blank, {}, [] ...)."""
+    if v is None or v is False:
+        return True
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v == 0 or v != v
+    if isinstance(v, (dict, list)):
+        return not v
+    return str(v).strip().lower() in _ERR_NULLS
+
+
+def real_error(v):
+    """True when v is a real error value; literal 'no error' markers (N/A, false, 0, {} ...) are logged and ignored."""
+    if v is None:
+        return False
+    if is_error_literal(v):
+        if not (isinstance(v, str) and v.strip() == "") and v is not False:
+            import cleaning as CL
+            CL.note("error_literal_ignored")
+        return False
+    return True
+
+
+class Span(object):
+    __slots__ = ("msg_tools", "tid", "sid", "pid", "name", "start", "end", "dur", "kind", "call", "conv", "agent", "env", "tool",
+                 "args", "result", "utext", "atext", "itok", "otok", "model", "cost", "err", "cancelled",
+                 "has_status", "fmt", "seq", "run", "src", "user", "final", "err_derived")
+
+    def __init__(self, fmt):
+        for s in self.__slots__:
+            setattr(self, s, None)
+        self.fmt = fmt
+        self.cancelled = False
+        self.has_status = False
+        self.final = False
+        self.err_derived = False
+
+
+# ---------------------------------------------------------------- record readers (see ingest.py)
 
 def iter_files(paths):
-    """Expand files / directories (recursive) to a sorted list of readable export files."""
-    out = []
-    for p in ([paths] if isinstance(paths, str) else list(paths)):
-        p = str(p)
-        if os.path.isdir(p):
-            for root, _, names in os.walk(p):
-                for n in sorted(names):
-                    base = n[:-3] if n.lower().endswith(".gz") else n
-                    if base.lower().endswith(EXTS) and not n.startswith("."):
-                        out.append(os.path.join(root, n))
-        elif os.path.isfile(p):
-            out.append(p)
-        else:
-            raise FileNotFoundError("source not found: %s" % p)
-    return sorted(set(out))
+    import ingest
+    return ingest.iter_files(paths)
 
 
-def _open(path):
-    if path.lower().endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8-sig", errors="replace", newline="")
-    return open(path, "r", encoding="utf-8-sig", errors="replace", newline="")
-
-
-def _iter_array(f, buf):
-    dec = json.JSONDecoder()
-    pos = buf.index("[") + 1
-    while True:
-        while True:
-            while pos < len(buf) and buf[pos] in " \t\r\n,":
-                pos += 1
-            if pos < len(buf):
-                break
-            more = f.read(1 << 22)
-            if not more:
-                return
-            buf, pos = buf[pos:] + more, 0
-        if buf[pos] == "]":
-            return
-        try:
-            obj, end = dec.raw_decode(buf, pos)
-        except ValueError:
-            more = f.read(1 << 22)
-            if not more:
-                raise
-            buf, pos = buf[pos:] + more, 0
-            continue
-        yield obj
-        pos = end
-
-
-_WRAP = ("data", "runs", "spans", "rows", "items", "records", "results", "Records", "entries", "value", "logs")
-_RECORD_HINTS = ("span_id", "spanId", "trace_id", "traceId", "run_type", "attributes", "id", "SpanId")
+def iter_records(paths, stats=None):
+    import ingest
+    return ingest.iter_records(paths, stats)
 
 
 def _otlp_val(v):
@@ -395,97 +637,6 @@ def otlp_attrs(a):
     if isinstance(a, list):
         return {x["key"]: _otlp_val(x.get("value")) for x in a if isinstance(x, dict) and "key" in x}
     return {}
-
-
-def _expand(obj):
-    if not isinstance(obj, dict):
-        return
-    if "resourceSpans" in obj:
-        for rs in obj["resourceSpans"] or []:
-            res = otlp_attrs((rs.get("resource") or {}).get("attributes"))
-            for ss in rs.get("scopeSpans") or rs.get("instrumentationLibrarySpans") or []:
-                for sp in ss.get("spans") or []:
-                    sp = dict(sp)
-                    sp["_resource"] = res
-                    yield sp
-        return
-    if isinstance(obj.get("tables"), list):  # Azure Log Analytics / App Insights query API
-        for t in obj["tables"]:
-            cols = [c.get("name") if isinstance(c, dict) else c for c in t.get("columns", [])]
-            for row in t.get("rows", []):
-                yield dict(zip(cols, row))
-        return
-    if isinstance(obj.get("traces"), list):  # GCP Cloud Trace
-        for tr in obj["traces"]:
-            for sp in tr.get("spans", []):
-                sp = dict(sp)
-                sp.setdefault("traceId", tr.get("traceId"))
-                yield sp
-        return
-    if not any(h in obj for h in _RECORD_HINTS):
-        for k in _WRAP:
-            if isinstance(obj.get(k), list):
-                for x in obj[k]:
-                    for y in _expand(x):
-                        yield y
-                return
-    yield obj
-
-
-def iter_records(paths, stats=None):
-    """Yield one dict per record from every file. Auto-detects JSON array / single JSON object (with common
-    wrappers: OTLP resourceSpans, Azure tables, GCP traces, {"data": [...]}) / JSONL / CSV / TSV; .gz allowed.
-    Bad JSONL lines are skipped and counted in stats['bad_lines']."""
-    files = iter_files(paths)
-    if not files:
-        raise FileNotFoundError("no .json/.jsonl/.ndjson/.csv/.tsv files found in: %s" % ", ".join(map(str, paths)))
-    if stats is not None:
-        stats.setdefault("files", []).extend(files)
-        stats.setdefault("bad_lines", 0)
-    for path in files:
-        base = path.lower()[:-3] if path.lower().endswith(".gz") else path.lower()
-        with _open(path) as f:
-            if base.endswith((".csv", ".tsv")):
-                for row in csv.DictReader(f, delimiter="\t" if base.endswith(".tsv") else ","):
-                    yield row
-                continue
-            head = f.read(1 << 22)
-            t = head.lstrip()
-            if not t:
-                continue
-            if t[0] == "[":
-                for obj in _iter_array(f, t):
-                    if stats is not None and not isinstance(obj, dict):
-                        stats["bad_lines"] += 1
-                    for r in _expand(obj):
-                        yield r
-                continue
-            f.seek(0)
-            first = f.readline()
-            try:
-                json.loads(first)
-                jsonl = True
-            except ValueError:
-                jsonl = False
-            f.seek(0)
-            if jsonl:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        if stats is not None:
-                            stats["bad_lines"] += 1
-                        continue
-                    if stats is not None and not isinstance(obj, dict):
-                        stats["bad_lines"] += 1
-                    for r in _expand(obj):
-                        yield r
-            else:
-                for r in _expand(json.load(f)):
-                    yield r
 
 
 def add_ingest_args(p):

@@ -154,10 +154,10 @@ class FlatTable(unittest.TestCase):
         self.assertTrue(runs["s2#t1"]["ends_without_answer"])
         self.assertEqual(runs["s1#t1"]["tool_calls"][0]["result"], "basic, pro")
 
-    def test_flat_without_map_fails_clearly(self):
-        opts = N.Opts("flat")
-        with self.assertRaises(SystemExit):
-            N.load_spans([fx("flat_table.csv")], opts)
+    def test_flat_without_map_is_auto_scaffolded(self):
+        runs, _, stats = runs_of("flat_table.csv", prices=False, fmt="flat")
+        self.assertEqual(sorted(runs), ["s1#t1", "s1#t2", "s2#t1"])
+        self.assertTrue(stats["auto_mapping"])
 
 
 class Readers(unittest.TestCase):
@@ -258,7 +258,7 @@ class CheckLogs(unittest.TestCase):
             rep = self.run_check("--src", fx(src), *extra)
             self.assertGreater(rep["counts"]["runs"], 0, src)
 
-    def test_not_ready_when_no_user_messages(self):
+    def test_gaps_degrade_instead_of_blocking(self):
         rows = [{"trace_id": "t%d" % i, "span_id": "s%d" % i, "span_name": "x", "start_timestamp": "2025-01-01T00:00:00Z",
                  "attributes": json.dumps({"gen_ai.operation.name": "chat", "gen_ai.request.model": "m"})}
                 for i in range(40)]
@@ -266,7 +266,7 @@ class CheckLogs(unittest.TestCase):
         with open(p, "w") as f:
             f.write("\n".join(json.dumps(r) for r in rows))
         rep = self.run_check("--src", p)
-        self.assertEqual(rep["verdict"], "NOT_READY")
+        self.assertEqual(rep["verdict"], "USABLE_WITH_GAPS")  # gaps shrink the analysis, they never block it
         st = {r["id"]: r["status"] for r in rep["requirements"]}
         self.assertEqual((st["R4"], st["R5"], st["R3"]), ("RED", "RED", "RED"))
         self.assertIn("message-content", rep["fix_list"][0] + rep["fix_list"][1] + rep["fix_list"][2])
