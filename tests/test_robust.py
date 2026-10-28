@@ -282,3 +282,17 @@ class Layers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SampleTests(unittest.TestCase):
+    def test_sample_keeps_whole_conversations_and_is_deterministic(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plugins", "procept-lite", "scripts"))
+        from plite.grade_prepare import sample_runs
+        runs = [{"run_id": "r%d" % i, "conversation_id": "c%d" % (i // 3), "agent": "a%d" % (i % 2)} for i in range(60)]
+        s1, s2 = sample_runs(runs, 10), sample_runs(runs, 10)
+        self.assertEqual(s1, s2)
+        self.assertGreaterEqual(len(s1), 10)
+        self.assertLess(len(s1), 60)
+        for cid in {r["conversation_id"] for r in s1}:
+            self.assertEqual(sum(r["conversation_id"] == cid for r in s1), 3)
+        self.assertEqual(sample_runs(runs, 0), runs)

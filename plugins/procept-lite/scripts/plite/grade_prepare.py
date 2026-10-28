@@ -82,8 +82,28 @@ def _clear(d, prefix, ext):
             os.remove(os.path.join(d, f))
 
 
+def sample_runs(runs, n):
+    """Deterministic sample of whole conversations (stable hash order, round-robin across agents) until >= n runs."""
+    if not n or len(runs) <= n:
+        return runs
+    import hashlib
+    convs = {}
+    for r in runs:
+        convs.setdefault(r.get("conversation_id") or r.get("run_id"), []).append(r)
+    buckets = {}
+    for cid, rs in sorted(convs.items(), key=lambda kv: hashlib.sha1(str(kv[0]).encode()).hexdigest()):
+        buckets.setdefault(str(rs[0].get("agent") or ""), []).append(rs)
+    picked, count = [], 0
+    while count < n and any(buckets.values()):
+        for b in list(buckets.values()):
+            if b and count < n:
+                rs = b.pop(0); picked += rs; count += len(rs)
+    keep = {r["run_id"] for r in picked}
+    return [r for r in runs if r["run_id"] in keep]
+
+
 def prepare(out, max_runs=20, max_chars=230000, audit_every=4, audit_batch=20, product=None,
-            price_per_mtok=None, force=False):
+            price_per_mtok=None, force=False, sample=None):
     out = os.path.abspath(out)
     src = os.path.join(out, "normalized", "runs.jsonl")
     if not os.path.exists(src):
@@ -91,6 +111,7 @@ def prepare(out, max_runs=20, max_chars=230000, audit_every=4, audit_batch=20, p
     runs = load_runs(src)
     if not runs:
         raise SystemExit("error: %s has no runs" % src)
+    runs = sample_runs(runs, sample)
     g = os.path.join(out, "grading")
     dirs = {k: os.path.join(g, k) for k in ("shards", "scores", "audit")}
     for d in dirs.values():
@@ -168,9 +189,10 @@ def main(argv=None):
     ap.add_argument("--product", default=None, help="one-line product description for the readers")
     ap.add_argument("--price-per-mtok", type=float, default=None, help="USD per million input tokens of the cheap model")
     ap.add_argument("--force", action="store_true", help="discard existing graded CSVs")
+    ap.add_argument("--sample", type=int, default=None, help="grade only ~N runs (whole conversations, spread across agents)")
     a = ap.parse_args(argv)
     est, wf = prepare(a.out, a.max_runs, a.max_chars, a.audit_every, a.audit_batch, a.product,
-                      a.price_per_mtok, a.force)
+                      a.price_per_mtok, a.force, a.sample)
     print("grading prepared: %d runs -> %d shards + %d audit batches (%d audit runs)"
           % (est["runs"], est["shards"], est["audit_batches"], est["audit_runs"]))
     print("approx input tokens: %d%s" % (est["approx_input_tokens"],

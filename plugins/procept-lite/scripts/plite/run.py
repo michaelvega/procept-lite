@@ -68,6 +68,7 @@ def main(argv=None):
         return 0
     p = argparse.ArgumentParser(prog="plite run", add_help=False)
     add_ingest_args(p)
+    p.add_argument("--sample", type=int, default=300)
     try:
         a, _ = p.parse_known_args(argv)
     except SystemExit:
@@ -117,7 +118,7 @@ def main(argv=None):
         print(ln)
     out_args = ["--out", out]
     if not os.path.exists(os.path.join(out, "scores.csv")):
-        rc = _step("grade_prepare", out_args)
+        rc = _step("grade_prepare", out_args + ["--sample", str(a.sample)])
         if rc != 0:
             return rc
         print("\nNext: grade the shards in %s/grading/shards with Haiku agents "
