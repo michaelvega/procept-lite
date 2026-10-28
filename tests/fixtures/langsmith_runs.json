@@ -1,0 +1,202 @@
+[
+ {
+  "id": "ls-r1",
+  "trace_id": "ls-r1",
+  "parent_run_id": null,
+  "run_type": "chain",
+  "name": "AgentExecutor",
+  "start_time": "2025-03-03T08:00:00.000000",
+  "end_time": "2025-03-03T08:00:06.000000",
+  "inputs": {
+   "input": "Book a table for 2 tonight"
+  },
+  "outputs": {
+   "output": "Booked for 8pm."
+  },
+  "error": null,
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-1"
+   },
+   "invocation_params": {}
+  }
+ },
+ {
+  "id": "ls-r1-llm",
+  "trace_id": "ls-r1",
+  "parent_run_id": "ls-r1",
+  "run_type": "llm",
+  "name": "ChatOpenAI",
+  "start_time": "2025-03-03T08:00:01.000000",
+  "end_time": "2025-03-03T08:00:02.000000",
+  "inputs": {
+   "messages": [
+    [
+     {
+      "lc": 1,
+      "type": "constructor",
+      "id": [
+       "langchain",
+       "schema",
+       "messages",
+       "HumanMessage"
+      ],
+      "kwargs": {
+       "content": "Book a table for 2 tonight",
+       "type": "human"
+      }
+     }
+    ]
+   ]
+  },
+  "outputs": {
+   "generations": [
+    [
+     {
+      "text": "",
+      "message": {
+       "kwargs": {
+        "content": "",
+        "tool_calls": [
+         {
+          "name": "book"
+         }
+        ]
+       }
+      }
+     }
+    ]
+   ],
+   "llm_output": {
+    "token_usage": {
+     "prompt_tokens": 400,
+     "completion_tokens": 25
+    },
+    "model_name": "gpt-4o"
+   }
+  },
+  "error": null,
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-1"
+   },
+   "invocation_params": {}
+  }
+ },
+ {
+  "id": "ls-r1-tool",
+  "trace_id": "ls-r1",
+  "parent_run_id": "ls-r1",
+  "run_type": "tool",
+  "name": "book_table",
+  "start_time": "2025-03-03T08:00:03.000000",
+  "end_time": "2025-03-03T08:00:04.000000",
+  "inputs": {
+   "input": "{'party': 2}"
+  },
+  "outputs": {
+   "output": "confirmed"
+  },
+  "error": null,
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-1"
+   },
+   "invocation_params": {}
+  }
+ },
+ {
+  "id": "ls-r2",
+  "trace_id": "ls-r2",
+  "parent_run_id": null,
+  "run_type": "chain",
+  "name": "AgentExecutor",
+  "start_time": "2025-03-03T08:02:00.000000",
+  "end_time": "2025-03-03T08:02:09.000000",
+  "inputs": {
+   "input": "Actually make it for 4"
+  },
+  "outputs": {
+   "output": ""
+  },
+  "error": null,
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-1"
+   },
+   "invocation_params": {}
+  }
+ },
+ {
+  "id": "ls-r2-llm",
+  "trace_id": "ls-r2",
+  "parent_run_id": "ls-r2",
+  "run_type": "llm",
+  "name": "ChatOpenAI",
+  "start_time": "2025-03-03T08:02:01.000000",
+  "end_time": "2025-03-03T08:02:02.000000",
+  "inputs": {
+   "messages": [
+    []
+   ]
+  },
+  "outputs": {
+   "generations": [
+    []
+   ]
+  },
+  "error": null,
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-1"
+   },
+   "invocation_params": {
+    "model": "gpt-4o"
+   }
+  },
+  "prompt_tokens": 500,
+  "completion_tokens": 30
+ },
+ {
+  "id": "ls-r2-tool",
+  "trace_id": "ls-r2",
+  "parent_run_id": "ls-r2",
+  "run_type": "tool",
+  "name": "book_table",
+  "start_time": "2025-03-03T08:02:03.000000",
+  "end_time": "2025-03-03T08:02:08.000000",
+  "inputs": {
+   "input": "{'party': 4}"
+  },
+  "outputs": null,
+  "error": "HTTPError: 503 service unavailable",
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-1"
+   },
+   "invocation_params": {}
+  }
+ },
+ {
+  "id": "ls-r3",
+  "trace_id": "ls-r3",
+  "parent_run_id": null,
+  "run_type": "chain",
+  "name": "AgentExecutor",
+  "start_time": "2025-03-03T08:05:00.000000",
+  "end_time": "2025-03-03T08:05:02.000000",
+  "inputs": {
+   "input": "thanks"
+  },
+  "outputs": {
+   "output": "You're welcome!"
+  },
+  "error": null,
+  "extra": {
+   "metadata": {
+    "thread_id": "thread-2"
+   },
+   "invocation_params": {}
+  }
+ }
+]

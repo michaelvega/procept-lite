@@ -1,0 +1,13 @@
+{
+ "conversation_id": "session",
+ "timestamp": "when",
+ "role": "speaker",
+ "content": "text",
+ "tool_name": "tool",
+ "tool_args": "tool_in",
+ "tool_result": "tool_out",
+ "error": "tool_error",
+ "model": "model",
+ "input_tokens": "tok_in",
+ "output_tokens": "tok_out"
+}

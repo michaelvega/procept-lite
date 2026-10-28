@@ -1,0 +1,8 @@
+session,when,speaker,text,tool,tool_in,tool_out,tool_error,model,tok_in,tok_out
+s1,2025-03-04 12:00:00,user,How do I change my plan?,,,,,,,
+s1,2025-03-04 12:00:02,tool,,get_plans,{},"basic, pro",,,,
+s1,2025-03-04 12:00:03,assistant,You can switch to pro in settings.,,,,,m1,300,20
+s1,2025-03-04 12:05:00,user,Switch me to pro,,,,,,,
+s1,2025-03-04 12:05:02,tool,,change_plan,"{""plan"": ""pro""}",,permission denied,,,
+s1,2025-03-04 12:05:03,assistant,"Sorry, I could not change it.",,,,,m1,400,15
+s2,2025-03-04 13:00:00,user,hello,,,,,,,

@@ -1,0 +1,7 @@
+operation_Id,id,operation_ParentId,name,timestamp,duration,success,gen_ai.operation.name,gen_ai.agent.call.id,gen_ai.conversation.id,gen_ai.tool.name,gen_ai.tool.call.arguments,gen_ai.tool.call.result,gen_ai.request.model,gen_ai.usage.input_tokens,gen_ai.usage.output_tokens,gen_ai.input.messages,gen_ai.output.messages,error.type
+az0,az0-root,,invoke_agent helper,2025-03-02T09:00:00.000Z,3200,True,invoke_agent,ai-call-0,ai-conv,,,,,,,"[{""role"": ""user"", ""content"": ""reset my password""}]","[{""role"": ""assistant"", ""content"": ""Done, check your inbox.""}]",
+az0,az0-root-llm,az0-root,chat gpt-4.1,2025-03-02T09:00:00.200Z,900,True,chat,ai-call-0,,,,,gpt-4.1,700,50,,,
+az0,az0-root-tool,az0-root,execute_tool account_api,2025-03-02T09:00:01.200Z,1500,True,execute_tool,ai-call-0,,account_api,"{""action"": ""reset""}","{""ok"": true}",,,,,,
+az1,az1-root,,invoke_agent helper,2025-03-02T09:01:00.000Z,3200,True,invoke_agent,ai-call-1,ai-conv,,,,,,,"[{""role"": ""user"", ""content"": ""export my data""}]",,
+az1,az1-root-llm,az1-root,chat gpt-4.1,2025-03-02T09:01:00.200Z,900,True,chat,ai-call-1,,,,,gpt-4.1,700,50,,,
+az1,az1-root-tool,az1-root,execute_tool account_api,2025-03-02T09:01:01.200Z,1500,False,execute_tool,ai-call-1,,account_api,"{""action"": ""export""}",,,,,,,HTTP500

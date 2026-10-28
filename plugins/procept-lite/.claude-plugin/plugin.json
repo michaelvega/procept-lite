@@ -1,0 +1,7 @@
+{
+  "name": "procept-lite",
+  "version": "0.1.0",
+  "description": "Turn multi-agent traces (LangSmith, Logfire, OpenTelemetry, GCP, AWS, Azure) into a graded failure network and a one-page scorecard.",
+  "author": { "name": "Procept" },
+  "keywords": ["agent-traces", "evaluation", "opentelemetry", "scorecard"]
+}
