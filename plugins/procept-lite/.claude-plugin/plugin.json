@@ -11,5 +11,5 @@
     "opentelemetry",
     "scorecard"
   ],
-  "license": "PolyForm-Small-Business-1.0.0"
+  "license": "MIT"
 }

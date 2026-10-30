@@ -27,7 +27,7 @@ Anything breaks, or the data will not load, even if you are a free user: email *
 
 ## License
 
-[PolyForm Small Business 1.0.0](LICENSE). In plain words: **free for individuals, researchers, non-profits, and any company with fewer than 100 people and under about $1M in annual revenue** (use it, change it, share it, keep the notice). **Larger companies need a commercial license: contact michael@procept.tech.** This is source-available, not OSI open source. The license text controls; the summary here is only a convenience.
+[MIT](LICENSE). Use it for anything, commercial included. If you want help running it on your own traces, email michael@procept.tech.
 
 ## Install
 
