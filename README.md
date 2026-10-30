@@ -94,7 +94,3 @@ Labels are model judgements about whether the user's goal was met, not user sati
 ```
 python3 -m unittest discover -s tests
 ```
-
-## License
-
-TBD (placeholder).
