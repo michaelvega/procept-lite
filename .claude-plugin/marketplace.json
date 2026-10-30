@@ -1,14 +1,21 @@
 {
   "name": "procept-marketplace",
-  "owner": { "name": "Procept" },
-  "metadata": { "description": "Procept plugins for understanding agent failures from traces." },
+  "owner": {
+    "name": "Procept"
+  },
+  "metadata": {
+    "description": "Procept plugins for understanding agent failures from traces."
+  },
   "plugins": [
     {
       "name": "procept-lite",
       "source": "./plugins/procept-lite",
       "description": "Turn agent traces into a failure network (errors, cost, latency, score) and a one-page scorecard.",
       "version": "0.1.0",
-      "author": { "name": "Procept" }
+      "author": {
+        "name": "Procept"
+      },
+      "license": "PolyForm-Small-Business-1.0.0"
     }
   ]
 }

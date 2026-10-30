@@ -4,6 +4,31 @@ A Claude Code plugin that turns multi-agent traces (LangChain/LangSmith, Pydanti
 
 The unit of analysis is the run (one agent call); a conversation holds several runs. Nothing is aggregated before scoring. Everything runs locally; Python 3.9+ standard library only.
 
+## What is Procept
+
+Procept (<https://procept.tech>) is a way of looking at an AI agent: not as a chat transcript, but as a **network of things that happened to people trying to get something done**. The ontology is small and fixed:
+
+| Thing | What it is |
+|---|---|
+| **Run** | One agent call. The atom. Every number is scored here first. |
+| **Conversation** | An ordered set of runs for one person with one goal. Never averaged away. |
+| **Goal** | What that person was trying to get done. Reached, dodged, or abandoned. |
+| **Tool** | A capability the agent can use. Becomes a node in the network. |
+| **Edge** | One tool called after another within a run. Together the edges are the agent's actual behaviour, not its intended design. |
+| **Dimension** | The four lenses every node and edge carries: **errors**, **cost**, **latency**, **score** (good +1, ambiguous 0, bad -1 against the person's goal). |
+| **Failure** | A place in the network where a dimension goes bad: a tool that errors, an expensive loop, a slow step, a goal that dies. |
+| **Fix** | A change to a node or edge, ranked by how many runs it would rescue and how much cost it would remove. |
+
+`procept-lite` builds that network from your exported logs (the **CIG**, conversation/cognition graph) and writes a one-page scorecard: how many runs reached the goal, where money and time leak, and which fixes come first. Everything runs locally on static files.
+
+## Help, and contact
+
+Anything breaks, or the data will not load, even if you are a free user: email **michael@procept.tech**. We want to hear about it.
+
+## License
+
+[PolyForm Small Business 1.0.0](LICENSE). In plain words: **free for individuals, researchers, non-profits, and any company with fewer than 100 people and under about $1M in annual revenue** (use it, change it, share it, keep the notice). **Larger companies need a commercial license: contact michael@procept.tech.** This is source-available, not OSI open source. The license text controls; the summary here is only a convenience.
+
 ## Install
 
 Inside Claude Code:
