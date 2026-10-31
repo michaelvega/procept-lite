@@ -972,6 +972,7 @@ def iter_records(paths, stats=None):
     stats.setdefault("files", [])
     stats.setdefault("bad_lines", 0)
     stats["files"].extend(files)
+    total = 0  # records yielded so far; stats["rec_files"] = [[source name, first record index, count], ...]
     for path in files:
         base = os.path.basename(path)
         ext = os.path.splitext(base.lower())[1]
@@ -992,10 +993,22 @@ def iter_records(paths, stats=None):
             if leaf_ext in IGNORED_EXT:
                 CL.note("ignored_extension", 1, os.path.basename(name))
                 continue
+            first = total
             try:
                 for r in _file_records(name, blob, stats):
+                    total += 1
                     yield sanitize(r)
             except (MemoryError, RecursionError):
                 CL.note("unreadable_file", 1, "%s (too large or too deeply nested)" % os.path.basename(name))
             except Exception as e:  # a damaged file must never abort the run
                 CL.note("unreadable_file", 1, "%s (%s)" % (os.path.basename(name), type(e).__name__))
+            finally:
+                if total > first:
+                    stats.setdefault("rec_files", []).append([_display_name(name), first, total - first])
+
+
+def _display_name(name):
+    """Source name for locators: file name only (zip members as archive!member), secrets and e-mails masked."""
+    from common import redact
+    head, sep, member = name.partition("!")
+    return redact(os.path.basename(head) + sep + member)[:120]

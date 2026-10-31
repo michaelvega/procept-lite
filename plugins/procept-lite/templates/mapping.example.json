@@ -1,5 +1,5 @@
 {
-  "_comment": "Column mapping for a flat table (values are YOUR column names). Every key is optional; delete the ones you do not have. Used with: plite.py inspect|normalize --src data.csv --map mapping.json",
+  "_comment": "Column mapping for a flat table (values are YOUR column names). Every key is optional except _rescue (the model that wrote and checked this mapping against raw rows; see mapping_rescue/README.md); delete the ones you do not have. Used with: plite.py inspect|normalize --src data.csv --map mapping.json",
   "run_id": "run_id",
   "conversation_id": "session_id",
   "trace_id": "trace_id",
@@ -31,5 +31,10 @@
   "model": "model",
   "cost_usd": "cost",
   "agent": "agent_name",
-  "environment": "env"
+  "environment": "env",
+  "_rescue": {
+    "model": "claude-sonnet-5-5",
+    "rows_reviewed": 40,
+    "notes": "Written by the mapping-rescue model after comparing mapping_rescue/sample_raw.jsonl and draft_preview.jsonl with the raw rows: say here what you changed from the draft and why."
+  }
 }

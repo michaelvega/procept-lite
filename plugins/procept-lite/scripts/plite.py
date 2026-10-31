@@ -6,22 +6,29 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# command -> (module, description[, function name[, arguments put in front of the command's own]])
 COMMANDS = {
     "inspect": ("check_logs", "check that the logs have what is needed"),
-    "normalize": ("normalize", "convert raw traces to canonical runs.jsonl"),
-    "grade-prepare": ("grade_prepare", "write grading shards, brief and cost estimate"),
+    "normalize": ("normalize", "convert raw traces to canonical runs.jsonl (needs the rescued mapping.json)"),
+    "grade-prepare": ("grade_prepare", "write grading shards, brief and cost estimate (needs the ingest sign-off)"),
     "grade-merge": ("grade_merge", "validate shard scores and write scores.csv"),
     "cig": ("build_cig", "build the CIG (graph csvs, flow_graph.json, dossiers)"),
     "viewer": ("build_viewer", "build the self-contained cig.html"),
-    "report": ("report", "write REPORT.md and REPORT.docx"),
-    "run": ("plite.run", "chain inspect, normalize, and (if scored) cig, viewer, report"),
+    "report": ("report", "build the customer scorecard (scorecard.html)"),
+    "run": ("plite.run", "do the next step of the pipeline and print NEXT: <step> | <instruction>"),
+    "scaffold": ("plite.scaffold", "write the mapping-rescue kit (raw sample, draft mapping, preview, README)"),
+    "check": ("plite.checks", "record or show a stage sign-off written by a verifying model"),
+    "status": ("plite.checks", "show every stage as verified, stale, failed or missing", "status_main"),
+    "study-init": ("plite.study", "copy the study starters to <out>/study", "main", ["init"]),
+    "study-build": ("plite.study", "assemble <out>/study/study.html from the section outputs", "main", ["build"]),
+    "study-clean": ("plite.study", "delete <out>/study", "main", ["clean"]),
 }
 
 
 def usage():
     lines = ["usage: plite.py <command> [args]  (each command accepts --out DIR)", "", "commands:"]
-    for name, (_, desc) in COMMANDS.items():
-        lines.append("  %-14s %s" % (name, desc))
+    for name, spec in COMMANDS.items():
+        lines.append("  %-14s %s" % (name, spec[1]))
     return "\n".join(lines)
 
 
@@ -34,7 +41,10 @@ def main(argv=None):
     if cmd not in COMMANDS:
         print("plite: unknown command %r\n\n%s" % (cmd, usage()), file=sys.stderr)
         return 2
-    modname = COMMANDS[cmd][0]
+    spec = COMMANDS[cmd]
+    modname = spec[0]
+    func = spec[2] if len(spec) > 2 else "main"
+    front = list(spec[3]) if len(spec) > 3 else []
     if "." not in modname:
         modname = "plite." + modname
     try:
@@ -44,7 +54,7 @@ def main(argv=None):
             print("plite: module for command %r is missing (%s)" % (cmd, modname), file=sys.stderr)
             return 3
         raise
-    rc = mod.main(argv[1:])
+    rc = getattr(mod, func)(front + argv[1:])
     return int(rc or 0)
 
 

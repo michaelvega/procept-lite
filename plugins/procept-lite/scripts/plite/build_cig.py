@@ -2,6 +2,7 @@
 
 The unit of analysis is the RUN. Nothing is aggregated before each run has its own
 row; node/edge/conversation/summary numbers are all derived from the per-run rows.
+Needs the ingest and merge sign-offs; runs in the unusable ledger are left out of every output.
 Standard library only.
 """
 import argparse
@@ -12,6 +13,9 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import checks  # noqa: E402
 
 LABELS = {1: "good", 0: "ambiguous", -1: "bad"}
 DIMENSIONS = ["errors", "cost", "latency", "score"]
@@ -487,7 +491,9 @@ def main(argv=None):
     ap.add_argument("--runs", help="override path to runs.jsonl")
     ap.add_argument("--scores", help="override path to scores.csv")
     a = ap.parse_args(argv)
-    runs_path = a.runs or os.path.join(a.out, "normalized", "runs.jsonl")
+    out = os.path.abspath(a.out)
+    checks.require(out, ["ingest", "merge"])
+    runs_path = a.runs or os.path.join(out, "normalized", "runs.jsonl")
     if not os.path.exists(runs_path):
         print("error: %s not found; run `normalize` first" % runs_path, file=sys.stderr)
         return 2
@@ -495,9 +501,16 @@ def main(argv=None):
     if not runs:
         print("error: %s has no runs" % runs_path, file=sys.stderr)
         return 2
-    scores = load_scores(a.scores or os.path.join(a.out, "scores.csv"))
+    unusable = checks.unusable_ids(out)
+    if unusable:
+        runs = [r for r in runs if str(r.get("run_id")) not in unusable]
+        if not runs:
+            print("error: every run is unusable; there is nothing to build a CIG from", file=sys.stderr)
+            return 2
+    scores = load_scores(a.scores or os.path.join(out, "scores.csv"))
+    scores = {k: v for k, v in scores.items() if k not in unusable}
     recs, nodes, edges, errors, convs, summary = build(runs, scores)
-    cig_dir = os.path.join(a.out, "cig")
+    cig_dir = os.path.join(out, "cig")
     write_all(cig_dir, recs, nodes, edges, errors, convs, summary)
     c = summary["counts"]
     print("CIG written to %s" % cig_dir)

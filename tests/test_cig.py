@@ -12,6 +12,21 @@ sys.path.insert(0, os.path.join(ROOT, "plugins", "procept-lite", "scripts"))
 from plite import build_cig, build_viewer, cig_query  # noqa: E402
 
 
+_GATE = {}
+
+
+def setUpModule():  # these tests exercise the stages themselves, not the sign-off gates (test_gates.py covers those)
+    _GATE["old"] = os.environ.get("PLITE_NO_GATE")
+    os.environ["PLITE_NO_GATE"] = "1"
+
+
+def tearDownModule():
+    if _GATE.get("old") is None:
+        os.environ.pop("PLITE_NO_GATE", None)
+    else:
+        os.environ["PLITE_NO_GATE"] = _GATE["old"]
+
+
 def tc(name, dur=1.0, ok=True, err=None):
     return {"ts": "2026-01-01T00:00:00Z", "name": name, "duration_s": dur, "args": "{}",
             "result": "r", "success": ok, "error": err}
@@ -164,13 +179,23 @@ class CigTests(unittest.TestCase):
     def test_viewer_self_contained_and_escaped(self):
         with tempfile.TemporaryDirectory() as d:
             self.build(d)
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(build_viewer.main(["--out", d]), 0)
+            old = os.environ.get("PLITE_NO_GATE")
+            os.environ["PLITE_NO_GATE"] = "1"
+            try:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(build_viewer.main(["--out", d]), 0)
+            finally:
+                if old is None:
+                    os.environ.pop("PLITE_NO_GATE", None)
+                else:
+                    os.environ["PLITE_NO_GATE"] = old
             html = rt(os.path.join(d, "cig.html"))
-            self.assertEqual(html.count("</script>"), 1)  # user text "</script>" is escaped
-            self.assertNotIn("http://", html.replace("http://www.w3.org/2000/svg", ""))
-            self.assertNotIn("https://", html)
+            self.assertEqual(html.count("</script>"), 1)  # tool names and user text are escaped
+            bare = html.replace("http://www.w3.org/2000/svg", "").replace(build_viewer.DEFAULT_URL, "")
+            self.assertNotIn("http://", bare)
+            self.assertNotIn("https://", bare)  # the System 5 link is the only address in the page
             self.assertNotIn("/*__DATA__*/", html)
+            self.assertNotIn("hello", html)  # no per-run text is embedded
 
     def test_tool_cap_groups_tail(self):
         runs = [run("r%d" % i, [tc("t%d" % i)]) for i in range(1, 80)]

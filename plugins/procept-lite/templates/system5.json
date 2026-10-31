@@ -1,0 +1,9 @@
+{
+  "_": "Customer-facing System 5 claims and link. <out>/system5.json, if present, overrides this file for one run.",
+  "url": "https://procept.tech/system5",
+  "accuracy_gain_pct": 49,
+  "goal_gain_pct": 28.5,
+  "cost_cut_pct": 50,
+  "errors": "conservative",
+  "latency": "conservative"
+}

@@ -10,8 +10,8 @@
     {
       "name": "procept-lite",
       "source": "./plugins/procept-lite",
-      "description": "Turn agent traces into a failure network (errors, cost, latency, score) and a one-page scorecard.",
-      "version": "0.1.0",
+      "description": "Turn agent traces into a failure network (errors, cost, latency, score) and a one-page scorecard, with every stage checked against the real data.",
+      "version": "0.2.0",
       "author": {
         "name": "Procept"
       },

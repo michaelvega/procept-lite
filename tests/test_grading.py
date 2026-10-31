@@ -10,6 +10,20 @@ sys.path.insert(0, os.path.join(ROOT, "plugins", "procept-lite", "scripts", "pli
 import grade_prepare as gp  # noqa: E402
 import grade_merge as gm  # noqa: E402
 
+_GATE = {}
+
+
+def setUpModule():  # these tests exercise the stages themselves, not the sign-off gates (test_gates.py covers those)
+    _GATE["old"] = os.environ.get("PLITE_NO_GATE")
+    os.environ["PLITE_NO_GATE"] = "1"
+
+
+def tearDownModule():
+    if _GATE.get("old") is None:
+        os.environ.pop("PLITE_NO_GATE", None)
+    else:
+        os.environ["PLITE_NO_GATE"] = _GATE["old"]
+
 
 def mkruns(spec):
     """spec: {conv: n_runs}"""
@@ -101,7 +115,7 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(s["counts"]["good"], 8)
         self.assertEqual(s["audit"]["exact_share"], 1.0)
-        self.assertEqual(s["audit"]["kappa"], 1.0)
+        self.assertEqual(s["audit"]["opposite_sign"], 0)
         self.assertEqual(len(list(csv.DictReader(open(os.path.join(d.name, "scores.csv"))))), 8)
         d.cleanup()
 
@@ -135,20 +149,26 @@ class TestMerge(unittest.TestCase):
         d.cleanup()
 
 
-class TestKappa(unittest.TestCase):
-    def test_perfect_and_none(self):
-        self.assertAlmostEqual(gm.kappa([("1", "1"), ("0", "0"), ("-1", "-1")]), 1.0)
-        self.assertIsNone(gm.kappa([]))
-
-    def test_known_value(self):
-        # 2x2: a=20 (1,1), b=5 (1,-1), c=10 (-1,1), d=15 (-1,-1): po=.7, pe=.5 -> kappa=.4
-        pairs = [("1", "1")] * 20 + [("1", "-1")] * 5 + [("-1", "1")] * 10 + [("-1", "-1")] * 15
-        self.assertAlmostEqual(gm.kappa(pairs), 0.4)
+class TestAudit(unittest.TestCase):
+    def test_opposite_signs_counted(self):
+        pairs = [("1", "1")] * 20 + [("1", "-1")] * 5 + [("-1", "1")] * 10 + [("-1", "-1")] * 15 + [("0", "1")] * 3
         self.assertEqual(gm.opposite_count(pairs), 15)
+        self.assertEqual(gm.opposite_count([]), 0)
 
-    def test_degenerate(self):
-        self.assertEqual(gm.kappa([("1", "1")] * 3), 1.0)
-        self.assertEqual(gm.kappa([("1", "1"), ("1", "1")] + [("0", "0")] * 0), 1.0)
+    def test_agreement_is_a_plain_share(self):
+        d = tempfile.TemporaryDirectory()
+        write_runs(d.name, mkruns({"a": 4}))
+        gp.prepare(d.name, max_runs=4, audit_every=1)
+        g = os.path.join(d.name, "grading")
+        idx = json.load(open(os.path.join(g, "shards_index.json")))
+        write_csv(os.path.join(g, "scores", idx[0]["shard"] + ".csv"), [(r, "1") for r in idx[0]["run_ids"]])
+        aidx = json.load(open(os.path.join(g, "audit_index.json")))
+        write_csv(os.path.join(g, "audit", aidx[0]["shard"] + ".csv"),
+                  [(r, "1" if i < 3 else "-1") for i, r in enumerate(aidx[0]["run_ids"])])
+        s, rc = gm.merge(d.name)
+        self.assertEqual((s["audit"]["n"], s["audit"]["exact_share"], s["audit"]["opposite_sign"]), (4, 0.75, 1))
+        self.assertEqual(set(s["audit"]), {"n", "exact_share", "opposite_sign"})
+        d.cleanup()
 
 
 if __name__ == "__main__":

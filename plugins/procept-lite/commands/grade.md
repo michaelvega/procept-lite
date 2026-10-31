@@ -1,5 +1,5 @@
 ---
-description: Grade a stratified sample of runs (default 300) good/ambiguous/bad with Haiku subagents
+description: Do the grading steps: grade runs, then verify the merge (Sonnet 5.5 or GPT 5.6 Terra agents)
 ---
 
-Use the procept-lite skill, one-action path steps 2-4 (normalize, grade-prepare with the sample cap, fan out Haiku graders in the background, grade-merge). State the cost in one line and proceed without asking. Output dir: `./procept-out` unless the user names one. Arguments from the user: $ARGUMENTS
+Use the procept-lite skill, steps `grade` and `merge_verify`. Run `plite.py run` until it prints `NEXT: grade`, state the cost estimate in one line and proceed: `workflow/grade.js` with `grading/workflow_args.json` (fallback `references/grading-brief.md`), then `plite.py run`, then `verify.js` with stage merge. Model floor Sonnet 5.5 or GPT 5.6 Terra, never Haiku. Output dir: `./procept-out` unless the user names one. Arguments from the user: $ARGUMENTS

@@ -28,7 +28,7 @@ class ManifestTests(unittest.TestCase):
     def test_plugin(self):
         p = load("plugins", "procept-lite", ".claude-plugin", "plugin.json")
         self.assertEqual(p["name"], "procept-lite")
-        self.assertEqual(p["version"], "0.1.0")
+        self.assertEqual(p["version"], "0.2.0")
         self.assertTrue(p["description"])
 
     def test_skill_and_commands(self):
@@ -46,7 +46,8 @@ class DispatcherTests(unittest.TestCase):
     def test_help_lists_commands(self):
         r = subprocess.run([sys.executable, PLITE, "--help"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0)
-        for c in ("inspect", "normalize", "grade-prepare", "grade-merge", "cig", "viewer", "report", "run"):
+        for c in ("inspect", "normalize", "grade-prepare", "grade-merge", "cig", "viewer", "report", "run", "scaffold",
+                  "check", "status", "study-init", "study-build", "study-clean"):
             self.assertIn(c, r.stdout)
 
     def test_unknown_command(self):

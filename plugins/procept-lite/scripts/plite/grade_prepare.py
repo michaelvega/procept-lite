@@ -1,13 +1,24 @@
-"""grade-prepare: shard normalized runs for blind outcome grading by cheap reader agents.
+"""grade-prepare: shard normalized runs for blind outcome grading by reader agents (Sonnet 5.5 / GPT 5.6 Terra minimum).
 
-Reads <out>/normalized/runs.jsonl. Writes under <out>/grading/: brief.md, shards/shard_NN.jsonl,
-audit/audit_NN.jsonl, shards_index.json, audit_index.json, workflow_args.json, scores/ (empty).
+Needs the ingest sign-off (plite.py check record). Reads <out>/normalized/runs.jsonl and writes the ledger of runs kept
+out of everything, normalized/unusable.csv (run_id,reason,source): the code rule `no_ask` (empty or whitespace user
+message, source auto) plus the unusable list of the ingest sign-off (source model). Only usable runs are sampled and
+sharded. Writes under <out>/grading/: brief.md, shards/shard_NN.jsonl, audit/audit_NN.jsonl, shards_index.json,
+audit_index.json, workflow_args.json, prepare_state.json, scores/ (empty).
 A conversation is never split across shards. Dossiers carry no vendor scores (blind)."""
 import argparse
+import csv
+import hashlib
+import io
 import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import checks  # noqa: E402
+import cleaning as CL  # noqa: E402
+
+NO_ASK = "no_ask"
 CSV_HEADER = "run_id,outcome_score,confidence,rationale,key_quote,persona,issue,reaction_run_id"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BRIEF_TEMPLATE = os.path.join(HERE, "..", "..", "skills", "procept-lite", "references", "grading-brief.md")
@@ -82,6 +93,72 @@ def _clear(d, prefix, ext):
             os.remove(os.path.join(d, f))
 
 
+def _clean(text):
+    return " ".join(str(text if text is not None else "").split())
+
+
+def unusable_rows(out, runs):
+    """The ledger rows [(run_id, reason, source)] for `runs`: the code rule first (empty user message -> no_ask), then
+    the runs the ingest sign-off listed as unusable. A run appears once."""
+    rows, seen = [], set()
+    for r in runs:
+        rid = str(r["run_id"])
+        if not (r.get("user_message") or "").strip() and rid not in seen:
+            rows.append((rid, NO_ASK, "auto"))
+            seen.add(rid)
+    ids = {str(r["run_id"]) for r in runs}
+    rec = checks.load(out, "ingest") or {}
+    for u in rec.get("unusable") if isinstance(rec.get("unusable"), list) else []:
+        rid = str(u.get("run_id") or "").strip() if isinstance(u, dict) else ""
+        if rid and rid in ids and rid not in seen:
+            rows.append((rid, _clean(u.get("reason")) or "unusable", "model"))
+            seen.add(rid)
+    return rows
+
+
+def write_ledger(out, rows):
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["run_id", "reason", "source"])
+    w.writerows(rows)
+    return checks.atomic_write(os.path.join(out, checks.UNUSABLE_LEDGER), buf.getvalue())
+
+
+def usable_split(out, runs):
+    """-> (usable runs, ledger rows)."""
+    rows = unusable_rows(out, runs)
+    bad = {r[0] for r in rows}
+    return [r for r in runs if str(r["run_id"]) not in bad], rows
+
+
+def _sha(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def state_for(out, rows, sample):
+    """What the shards were built from: the runs file, the unusable ids and the sample size."""
+    return {"runs_sha": _sha(os.path.join(out, "normalized", "runs.jsonl")),
+            "unusable": sorted(r[0] for r in rows), "sample": int(sample or 0)}
+
+
+def shards_current(out, sample=None):
+    """True when grading/ was prepared from the runs, unusable list and sample size as they are now."""
+    try:
+        with open(os.path.join(out, "grading", "prepare_state.json"), encoding="utf-8") as f:
+            old = json.load(f)
+        runs = load_runs(os.path.join(out, "normalized", "runs.jsonl"))
+    except (OSError, ValueError):
+        return False
+    return old == state_for(out, unusable_rows(out, runs), sample)
+
+
 def sample_runs(runs, n):
     """Deterministic sample of whole conversations (stable hash order, round-robin across agents) until >= n runs."""
     if not n or len(runs) <= n:
@@ -105,13 +182,24 @@ def sample_runs(runs, n):
 def prepare(out, max_runs=20, max_chars=230000, audit_every=4, audit_batch=20, product=None,
             price_per_mtok=None, force=False, sample=None):
     out = os.path.abspath(out)
+    checks.require(out, ["ingest"])
     src = os.path.join(out, "normalized", "runs.jsonl")
     if not os.path.exists(src):
         raise SystemExit("error: %s not found; run `normalize` first" % src)
     runs = load_runs(src)
     if not runs:
         raise SystemExit("error: %s has no runs" % src)
-    runs = sample_runs(runs, sample)
+    usable, ledger = usable_split(out, runs)
+    write_ledger(out, ledger)
+    ledger_report = CL.Report()
+    for rid, reason, source in ledger:
+        kind = CL.unusable_kind(reason, source)
+        ledger_report.note(kind, 1, reason if kind == "unusable_model" else None)
+    CL.write_section(out, "Unusable runs", ledger_report)
+    if not usable:
+        raise SystemExit("error: all %d runs are unusable (see %s); there is nothing to grade"
+                         % (len(runs), os.path.join(out, checks.UNUSABLE_LEDGER)))
+    runs = sample_runs(usable, sample)
     g = os.path.join(out, "grading")
     dirs = {k: os.path.join(g, k) for k in ("shards", "scores", "audit")}
     for d in dirs.values():
@@ -169,7 +257,9 @@ def prepare(out, max_runs=20, max_chars=230000, audit_every=4, audit_batch=20, p
     chars = sum(os.path.getsize(e["file"]) for e in wf["shards"] + wf["audits"])
     n_jobs = len(wf["shards"]) + len(wf["audits"])
     tokens = (chars + len(brief) * n_jobs) // 4
-    est = {"runs": len(runs), "shards": len(index), "audit_batches": len(aindex), "audit_runs": len(aud),
+    checks.atomic_write(os.path.join(g, "prepare_state.json"), json.dumps(state_for(out, ledger, sample), indent=1))
+    est = {"runs": len(runs), "usable": len(usable), "unusable": len(ledger),
+           "shards": len(index), "audit_batches": len(aindex), "audit_runs": len(aud),
            "approx_input_tokens": tokens, "approx_usd": None, "price_per_mtok": price_per_mtok,
            "note": "input only, chars/4; readers re-read context and write output, so treat as a lower bound"}
     if price_per_mtok is not None:
@@ -187,7 +277,7 @@ def main(argv=None):
     ap.add_argument("--audit-every", type=int, default=4, help="audit every Nth run of each shard (0 = none)")
     ap.add_argument("--audit-batch", type=int, default=20)
     ap.add_argument("--product", default=None, help="one-line product description for the readers")
-    ap.add_argument("--price-per-mtok", type=float, default=None, help="USD per million input tokens of the cheap model")
+    ap.add_argument("--price-per-mtok", type=float, default=None, help="USD per million input tokens of the grading model (Sonnet 5.5 or GPT 5.6 Terra)")
     ap.add_argument("--force", action="store_true", help="discard existing graded CSVs")
     ap.add_argument("--sample", type=int, default=None, help="grade only ~N runs (whole conversations, spread across agents)")
     a = ap.parse_args(argv)
@@ -195,6 +285,8 @@ def main(argv=None):
                       a.price_per_mtok, a.force, a.sample)
     print("grading prepared: %d runs -> %d shards + %d audit batches (%d audit runs)"
           % (est["runs"], est["shards"], est["audit_batches"], est["audit_runs"]))
+    print("usable runs: %d, unusable runs: %d (kept out of grading and the CIG; ledger: %s)"
+          % (est["usable"], est["unusable"], os.path.join(a.out, checks.UNUSABLE_LEDGER)))
     print("approx input tokens: %d%s" % (est["approx_input_tokens"],
           "  approx $%.4f" % est["approx_usd"] if est["approx_usd"] is not None else "  (pass --price-per-mtok for $)"))
     print("brief: %s" % wf["brief"])

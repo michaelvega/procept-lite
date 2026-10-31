@@ -13,6 +13,21 @@ import check_logs  # noqa: E402
 import common  # noqa: E402
 import normalize as N  # noqa: E402
 
+
+_GATE = {}
+
+
+def setUpModule():  # these tests exercise the stages themselves, not the sign-off gates (test_gates.py covers those)
+    _GATE["old"] = os.environ.get("PLITE_NO_GATE")
+    os.environ["PLITE_NO_GATE"] = "1"
+
+
+def tearDownModule():
+    if _GATE.get("old") is None:
+        os.environ.pop("PLITE_NO_GATE", None)
+    else:
+        os.environ["PLITE_NO_GATE"] = _GATE["old"]
+
 FX = os.path.join(ROOT, "tests", "fixtures")
 
 

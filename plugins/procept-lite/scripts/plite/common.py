@@ -30,6 +30,10 @@ SECRET_RE = re.compile(
     r"[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}&]{4,}")
 
 
+SECRET_KEY_RE = re.compile(r"(?i)pass(?:word|wd)?|pwd|secret|token|api[_-]?key|apikey|authorization|credential|private[_-]?key")
+PHONE_RE = re.compile(r"(?<![\w.])\+?\d[\d ().\-]{7,}\d(?![\w.])")
+
+
 CARD_RE = re.compile(r"(?<![\d.])\d(?:[ -]?\d){12,18}(?![\d.])")
 
 
@@ -58,9 +62,13 @@ def redact_secrets(s):
     return CARD_RE.sub(_card_sub, SECRET_RE.sub("[secret]", s))
 
 
+def _phone_sub(m):
+    return "[phone]" if 9 <= len(re.sub(r"\D", "", m.group(0))) <= 15 and re.search(r"[ ().+\-]", m.group(0)) else m.group(0)
+
+
 def redact(s):
     """Replace e-mail addresses, API tokens, passwords and card numbers with placeholders."""
-    return redact_secrets(EMAIL_RE.sub("[email]", str(s)))
+    return PHONE_RE.sub(_phone_sub, redact_secrets(EMAIL_RE.sub("[email]", str(s))))
 
 
 # ---------------------------------------------------------------- sanitising (surrogates, control chars, depth)
@@ -258,14 +266,61 @@ def to_float(v):
 
 
 def write_json(path, obj):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+    """Write JSON through a temp file and a rename, so a reader never sees a half-written file."""
+    import checks
+    checks.atomic_write(path, json.dumps(obj, indent=2, ensure_ascii=False, default=str))
 
 
 def load_json_file(path):
     with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
+
+
+# ---------------------------------------------------------------- strict mode: the mapping comes from a model
+
+RESCUE_MIN_ROWS = 20
+
+
+class RescueError(ValueError):
+    """The mapping is missing or not accepted (no model reviewed it, or it is below the floor): one actionable line."""
+
+
+def strict():
+    """True unless the dev/test bypass is set: only a mapping written by a model's mapping rescue may be applied."""
+    import checks
+    return not checks.gates_disabled()
+
+
+def no_mapping_message(out=None):
+    d = out or "<out>"
+    return ("no mapping.json yet: run `plite.py scaffold --src <your export> --out %s`, then have a Sonnet 5.5 / GPT 5.6 "
+            "Terra model (or better) follow %s to write %s"
+            % (d, os.path.join(d, "mapping_rescue", "README.md"), os.path.join(d, "mapping.json")))
+
+
+def rescue_problem(mapping, n_raw=None):
+    """None when `mapping` carries a valid _rescue block, else ONE line saying what is wrong and what to do.
+    n_raw (the number of raw records in the export) enables the rows_reviewed >= min(20, n_raw) check."""
+    import checks
+    if not isinstance(mapping, dict):
+        return "mapping.json must be a JSON object written by the mapping-rescue model (see mapping_rescue/README.md)"
+    r = mapping.get("_rescue")
+    if not isinstance(r, dict):
+        return ("mapping.json has no _rescue block {\"model\": <id>, \"rows_reviewed\": <int>, \"notes\": <text>}: a model must "
+                "review the raw rows and write it (see mapping_rescue/README.md)")
+    model = r.get("model")
+    if not checks.model_allowed(model):
+        return ("_rescue.model %r is below the floor (Sonnet 5.5 or GPT 5.6 Terra, or better; never Haiku): redo the mapping "
+                "rescue with an allowed model and put its id there" % (model,))
+    rows = r.get("rows_reviewed")
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+        return "_rescue.rows_reviewed must be a whole number: how many raw rows the model compared against the mapping"
+    if n_raw is not None and rows < min(RESCUE_MIN_ROWS, n_raw):
+        return ("_rescue.rows_reviewed is %d but at least %d raw rows must be reviewed (the export has %d): review more "
+                "rows, then update the number" % (rows, min(RESCUE_MIN_ROWS, n_raw), n_raw))
+    if r.get("notes") is not None and not isinstance(r.get("notes"), str):
+        return "_rescue.notes must be text"
+    return None
 
 
 # ---------------------------------------------------------------- time
@@ -642,7 +697,8 @@ def otlp_attrs(a):
 def add_ingest_args(p):
     p.add_argument("--src", nargs="+", required=True, help="export file(s) or directories (json/jsonl/csv)")
     p.add_argument("--format", default="auto", choices=["auto", "otel", "langsmith", "flat"])
-    p.add_argument("--map", dest="mapping", help="mapping.json for flat tables (see templates/mapping.example.json)")
+    p.add_argument("--map", dest="mapping", help="mapping.json written by the mapping rescue (default: <out>/mapping.json; "
+                                                 "see templates/mapping.example.json)")
     p.add_argument("--prices", help="prices.json: model -> {input_per_mtok, output_per_mtok}")
     p.add_argument("--noise-regex", help="drop spans whose name matches this regex (in addition to non-agent spans)")
     p.add_argument("--tool-regex", help="treat spans whose name matches this regex as tool calls")

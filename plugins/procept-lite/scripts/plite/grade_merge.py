@@ -1,32 +1,28 @@
 """grade-merge: validate every grader CSV, write <out>/scores.csv and <out>/grading/summary.json.
 
 Checks per shard: header, row ids match the shard exactly, score in {1,0,-1}, confidence in 0..1.
-Audit agreement compares blind re-scores with the primary scores (exact share, Cohen's kappa, opposite signs).
+summary.json also lists the rows whose key_quote is not found verbatim (whitespace-normalised) in that run's dossier
+text (quote_not_found), and the share of blind re-scores that agree with the primary scores (internal numbers).
+<out>/grading/overrides.csv (run_id,outcome_score,rationale,reason), written by the merge verifier, is applied on top of
+the shard rows when scores.csv is written (overrides_applied). The merge sign-off hashes the shard CSVs only, so
+applying overrides never makes it stale.
 --resume only lists shards with no CSV yet (and writes grading/resume_args.json for workflow/grade.js)."""
 import argparse
 import collections
 import csv
+import hashlib
+import io
 import json
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import checks  # noqa: E402
 
 CSV_HEADER = "run_id,outcome_score,confidence,rationale,key_quote,persona,issue,reaction_run_id"
 COLS = CSV_HEADER.split(",")
 VALID = ("1", "0", "-1")
 csv.field_size_limit(10 ** 9)
-
-
-def kappa(pairs):
-    """Cohen's kappa over (a, b) label pairs. Degenerate chance agreement of 1 -> 1.0 if all agree else 0.0."""
-    n = len(pairs)
-    if n == 0:
-        return None
-    po = sum(a == b for a, b in pairs) / n
-    ca, cb = collections.Counter(a for a, _ in pairs), collections.Counter(b for _, b in pairs)
-    pe = sum(ca[k] * cb[k] for k in set(ca) | set(cb)) / (n * n)
-    if pe >= 1.0:
-        return 1.0 if po == 1.0 else 0.0
-    return (po - pe) / (1 - pe)
 
 
 def opposite_count(pairs):
@@ -95,7 +91,10 @@ def load_set(g, index_name, sub):
         if not os.path.exists(path):
             missing.append(x["shard"])
             continue
-        r, pr = validate_csv(path, x["run_ids"])
+        try:
+            r, pr = validate_csv(path, x["run_ids"])
+        except (OSError, ValueError, csv.Error) as e:  # unreadable bytes: the shard is simply not usable yet
+            r, pr = {}, ["the CSV could not be read (%s)" % type(e).__name__]
         for rid, row in r.items():
             row["_shard"] = x["shard"]
             rows[rid] = row
@@ -112,6 +111,111 @@ def canon_personas(rows):
         r["persona"] = seen.setdefault(p.lower(), p) if p else ""
         r["issue"] = " ".join((r.get("issue") or "").split())
 
+
+# ---------------------------------------------------------------- quotes
+
+def _squash(s):
+    return " ".join(str(s).split())
+
+
+def _strings(o, acc, depth=0):
+    if isinstance(o, str):
+        if o.strip():
+            acc.append(_squash(o))
+    elif depth < 24 and isinstance(o, dict):
+        for v in o.values():
+            _strings(v, acc, depth + 1)
+    elif depth < 24 and isinstance(o, list):
+        for v in o:
+            _strings(v, acc, depth + 1)
+
+
+def quote_not_found(g, idx, rows):
+    """run ids (in shard order) whose key_quote is not found verbatim, whitespace-normalised, in the text of that run's
+    dossier (the shard line the grader read: the run plus its conversation context). Empty quotes are not checked."""
+    wanted = {r["run_id"]: _squash(r.get("key_quote") or "") for r in rows}
+    wanted = {k: v for k, v in wanted.items() if v}
+    missing = []
+    for x in idx:
+        ids = [i for i in x["run_ids"] if i in wanted]
+        if not ids:
+            continue
+        texts = {}
+        try:
+            with open(os.path.join(g, "shards", x["shard"] + ".jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(d, dict) and d.get("run_id") in wanted:
+                        acc = []
+                        _strings(d, acc)
+                        texts[d["run_id"]] = acc
+        except OSError:
+            pass
+        for rid in ids:
+            if not any(wanted[rid] in t for t in texts.get(rid, ())):
+                missing.append(rid)
+    return missing
+
+
+# ---------------------------------------------------------------- overrides
+
+def file_sha(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def load_overrides(g, known_ids):
+    """-> ({run_id: row}, [problems]). Rows with an unknown run id or a score outside {1,0,-1} are listed and ignored."""
+    path = os.path.join(g, "overrides.csv")
+    if not os.path.isfile(path):
+        return {}, []
+    out, bad = {}, []
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            rd = csv.DictReader(f)
+            if not rd.fieldnames or "run_id" not in rd.fieldnames or "outcome_score" not in rd.fieldnames:
+                return {}, ["overrides.csv needs the columns run_id,outcome_score,rationale,reason"]
+            for ln, r in enumerate(rd, 2):
+                rid = (r.get("run_id") or "").strip()
+                sc = (r.get("outcome_score") or "").strip()
+                if not rid and not sc:
+                    continue
+                if rid not in known_ids:
+                    bad.append("line %d: run id %r is not a scored run" % (ln, rid))
+                elif sc not in VALID:
+                    bad.append("line %d: score %r for %s is not 1, 0 or -1" % (ln, sc, rid))
+                else:
+                    out[rid] = {"outcome_score": sc, "rationale": " ".join((r.get("rationale") or "").split()),
+                                "reason": " ".join((r.get("reason") or "").split())}
+    except (OSError, ValueError, csv.Error) as e:
+        return {}, ["overrides.csv could not be read (%s)" % type(e).__name__]
+    return out, bad
+
+
+def apply_overrides(rows, ov):
+    """Overrides replace the score (and the rationale when given) of the shard row; a run moved to +1 loses its issue
+    label. -> [{run_id, from, to, reason}] for the runs that were overridden."""
+    done = []
+    for r in rows:
+        o = ov.get(r["run_id"])
+        if o is None:
+            continue
+        done.append({"run_id": r["run_id"], "from": r["outcome_score"], "to": o["outcome_score"], "reason": o["reason"]})
+        r["outcome_score"] = o["outcome_score"]
+        if o["rationale"]:
+            r["rationale"] = o["rationale"]
+        if o["outcome_score"] == "1":
+            r["issue"] = ""
+    return done
+
+
+# ---------------------------------------------------------------- merge
 
 def merge(out, resume=False):
     out = os.path.abspath(out)
@@ -134,11 +238,15 @@ def merge(out, resume=False):
     expected = [rid for x in idx for rid in x["run_ids"]]
     rows = [S[rid] for rid in expected if rid in S]
     canon_personas(rows)
-    with open(os.path.join(out, "scores.csv"), "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, COLS, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
+    quote_missing = quote_not_found(g, idx, rows)
+    ov, ov_bad = load_overrides(g, {r["run_id"] for r in rows})
+    overridden = apply_overrides(rows, ov)
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, COLS, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    checks.atomic_write(os.path.join(out, "scores.csv"), buf.getvalue())
     counts = collections.Counter(r["outcome_score"] for r in rows)
     personas = collections.defaultdict(lambda: [0, 0])
     for r in rows:
@@ -146,10 +254,9 @@ def merge(out, resume=False):
             personas[r["persona"]][0] += 1
             personas[r["persona"]][1] += int(r["outcome_score"])
     pairs = [(S[k]["outcome_score"], A[k]["outcome_score"]) for k in A if k in S]
-    audit = {"n": len(pairs), "exact_share": None, "kappa": None, "opposite_sign": 0}
+    audit = {"n": len(pairs), "exact_share": None, "opposite_sign": 0}
     if pairs:
-        audit.update(exact_share=round(sum(a == b for a, b in pairs) / len(pairs), 4),
-                     kappa=round(kappa(pairs), 4), opposite_sign=opposite_count(pairs))
+        audit.update(exact_share=round(sum(a == b for a, b in pairs) / len(pairs), 4), opposite_sign=opposite_count(pairs))
     warnings = []
     no_persona = sum(1 for r in rows if not r["persona"])
     if no_persona:
@@ -165,14 +272,19 @@ def merge(out, resume=False):
         "personas": sorted(({"persona": p, "runs": c[0], "mean_score": round(c[1] / c[0], 3)} for p, c in personas.items()),
                            key=lambda d: -d["runs"]),
         "audit": audit,
+        "quote_not_found": quote_missing,
+        "overrides_applied": len(overridden),
+        "overrides_detail": overridden,
+        "overrides_invalid": ov_bad,
         "problems": {**p1, **{k: v for k, v in p2.items()}},
         "missing_shards": miss1, "missing_audits": miss2,
         "rerun_shards": sorted(set(p1) | set(miss1)),
         "rerun_audits": sorted(set(p2) | set(miss2)),
         "warnings": warnings,
+        "inputs_hash": checks.artifact_hash(out, "merge"),
+        "overrides_hash": file_sha(os.path.join(g, "overrides.csv")),
     }
-    with open(os.path.join(g, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=1)
+    checks.atomic_write(os.path.join(g, "summary.json"), json.dumps(summary, indent=1))
     return summary, (0 if not summary["rerun_shards"] else 1)
 
 
@@ -190,7 +302,13 @@ def main(argv=None):
         s["runs_scored"], s["runs_expected"], s["counts"]["good"], s["counts"]["ambiguous"], s["counts"]["bad"]))
     au = s["audit"]
     if au["n"]:
-        print("audit: n=%d exact=%.0f%% kappa=%.2f opposite-sign=%d" % (au["n"], au["exact_share"] * 100, au["kappa"], au["opposite_sign"]))
+        print("audit: n=%d exact=%.0f%% opposite-sign=%d" % (au["n"], au["exact_share"] * 100, au["opposite_sign"]))
+    if s["quote_not_found"]:
+        print("key_quote not found verbatim in the run: %d rows (e.g. %s)" % (len(s["quote_not_found"]), s["quote_not_found"][0]))
+    if s["overrides_applied"]:
+        print("overrides applied: %d" % s["overrides_applied"])
+    for pr in s["overrides_invalid"][:3]:
+        print("warning: %s" % pr)
     for sh, pr in s["problems"].items():
         print("PROBLEM %s: %s" % (sh, "; ".join(pr[:3])))
     if s["rerun_shards"]:

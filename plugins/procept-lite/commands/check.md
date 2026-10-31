@@ -1,5 +1,5 @@
 ---
-description: Dry run: inspect exported logs and show what the CIG will and will not cover
+description: Dry run: check that exported logs have what is needed and show the state of every stage
 ---
 
-Use the procept-lite skill. Run `inspect` on the given files and explain the GREEN/AMBER/RED table as "what will be cleaned, estimated or dropped", never as a blocker (see "Exceptions and degradation"). Do not ask the user to fix anything. Output dir: `./procept-out` unless the user names one. Arguments from the user: $ARGUMENTS
+Use the procept-lite skill. Run `plite.py inspect` on the given files and, if `<OUT>` already exists, `plite.py status`. Explain in plain words what the data supports and which dimension (errors, cost, latency, score) it will or will not carry. Do not ask the user to fix anything and do not start the loop. Output dir: `./procept-out` unless the user names one. Arguments from the user: $ARGUMENTS

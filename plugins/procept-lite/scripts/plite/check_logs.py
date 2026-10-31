@@ -2,6 +2,7 @@
 
 Usage: python3 plite.py inspect --src FILE_OR_DIR... [--format ..] [--map mapping.json] [--prices prices.json]
                                 [--noise-regex RE] [--tool-regex RE] [--out DIR]
+(the mapping is the one a model wrote in the mapping rescue: --map, or <out>/mapping.json; see plite.py scaffold)
 Writes DIR/inspect.json and DIR/inspect.md. Exit code 0 even for NOT_READY (the report is the product); 2 only
 when nothing could be read.
 
@@ -221,8 +222,9 @@ def build_report(runs, spans, stats, opts):
     }
     if n == 0:
         rep["fix_list"].insert(0, stats.get("mapping_failed") or (
-            "No runs could be built (formats seen: %s). Write a mapping file (templates/mapping.example.json) "
-            "and pass --map; see references/data-gaps.md#flat-tables" % (rep["formats"] or "none")))
+            "No runs could be built (formats seen: %s). Run `plite.py scaffold`, have a model write mapping.json from "
+            "mapping_rescue/README.md and pass it with --map (see templates/mapping.example.json and "
+            "references/data-gaps.md#flat-tables)" % (rep["formats"] or "none")))
     return rep
 
 

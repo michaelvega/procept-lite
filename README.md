@@ -19,7 +19,7 @@ Procept (<https://procept.tech>) is a way of looking at an AI agent: not as a ch
 | **Failure** | A place in the network where a dimension goes bad: a tool that errors, an expensive loop, a slow step, a goal that dies. |
 | **Fix** | A change to a node or edge, ranked by how many runs it would rescue and how much cost it would remove. |
 
-`procept-lite` builds that network from your exported logs (the **CIG**, conversation/cognition graph) and writes a one-page scorecard: how many runs reached the goal, where money and time leak, and which fixes come first. Everything runs locally on static files.
+`procept-lite` builds that network from your exported logs (the **CIG**, conversation/cognition graph) and writes a one-page scorecard: how many runs reached the goal, where money and time leak, and what System 5 gives you. Everything runs locally on static files.
 
 ## Help, and contact
 
@@ -45,49 +45,68 @@ claude plugin marketplace add <repo path or git url>
 claude plugin install procept-lite@procept-marketplace
 ```
 
-## Quickstart (one action)
+## Quickstart
 
 1. Export your agent logs (any platform, any format; walkthroughs in `skills/procept-lite/references/exports/`).
 2. Tell Claude "build the CIG" or run `/procept-lite:start <path>`.
 
-Claude states a two-sentence plan (it only transforms static files locally and changes nothing in your systems), cleans and maps the data, grades a stratified sample of up to 300 runs with Haiku agents (configurable; cost stated up front), and builds the CIG, viewer and report. No further questions unless it is truly blocked.
+Claude states a two-sentence plan (it only reads static files locally and changes nothing in your systems) and runs the loop below with no further questions. At the end you get `cig.html` and `scorecard.html` and the number of runs graded.
 
-Degrade, never block: missing timestamps drop latency, missing tokens are estimated, missing error fields are derived from result text, dirty or unknown formats are cleaned and auto-mapped. Every repair and drop is listed in `cleaning_report.md`; see `skills/procept-lite/references/exceptions.md`.
+## How it works, and why
 
-Script directly: `python3 plugins/procept-lite/scripts/plite.py <inspect|normalize|grade-prepare|grade-merge|cig|viewer|report|run> --out ./procept-out`.
+The scripts, templates and prompts in this plugin are **starters**. The agent reads them, copies them and edits them for your dataset; what stays fixed is the architecture and the file contracts between stages: raw export, `mapping.json`, `normalized/runs.jsonl`, grading shards, `scores.csv`, `cig/`, then the two pages. Code computes numbers and validates; models judge reality and write the words.
 
-## Output files (in `procept-out/`)
+The agent runs `plite.py run`, which does the next code step and ends with one line `NEXT: <step> | <instruction>`. A Sonnet 5.5 or GPT 5.6 Terra agent does that step, then `run` again, until `NEXT: done`. The steps:
+
+| Step | What a model does |
+|---|---|
+| `mapping_rescue` | always reads your raw rows and writes the field mapping; nothing is mapped automatically |
+| `ingest_verify` | compares normalized runs with their raw rows |
+| `grade` | blind readers grade every run +1 / 0 / -1 against the user's goal |
+| `merge_verify` | re-reads a sample and every risky grade, corrects wrong ones |
+| `cig_verify` | recounts the network from the runs |
+| `study` | builds a temporary study from the starters and writes the one user-goal problem |
+| `scorecard_verify` | checks every number and looks at both pages |
+
+Each verification is signed off in a small record, and a later stage refuses to run on an artifact whose sign-off is missing or out of date. Why: a starter can be wrong for one dataset, and a wrong column or a wrong grade would go straight into the scorecard. A smaller correct sample is better than a larger noisy one, so a run that cannot be verified is classified **unusable** and left out of grading and every count.
+
+Workflows for the Workflow tool are in `plugins/procept-lite/workflow/` (`mapping.js`, `grade.js`, `verify.js`, `study.js`); each documents a fallback for hosts without it.
+
+Script directly: `python3 plugins/procept-lite/scripts/plite.py <run|status|check|scaffold|inspect|normalize|grade-prepare|grade-merge|cig|viewer|report|study-init|study-build|study-clean> --out ./procept-out`.
+
+## Models (required)
+
+Use **Sonnet 5.5** (`claude-sonnet-5-5`) or **GPT 5.6 Terra** as the minimum for every step where a model judges anything: mapping, verification, grading, the study and the problem write-up. Never Haiku, and no smaller model: it mislabels runs and the errors go straight into the scorecard. A smaller host model should delegate every judgement step to one of these. Anything above them is fine.
+
+On Claude Code the bundled workflows use Sonnet 5.5. On a GPT host, run the same briefs with GPT 5.6 Terra.
+
+## Output (in `procept-out/`)
 
 | File | Content |
 |---|---|
-| `inspect.md`, `inspect.json` | GREEN/AMBER/RED data sufficiency check |
-| `cleaning_report.md` | every repair, drop, estimate and assumption, with counts |
-| `mapping.auto.json` | auto-scaffolded field mapping (if the schema was unknown) |
-| `normalized/runs.jsonl` | one canonical dossier per run |
-| `grading/` | shards, brief, per-shard scores, audit |
-| `scores.csv` | outcome_score (1/0/-1), confidence, rationale, persona, issue per run |
-| `cig/` | nodes, edges, runs, convs, errors CSVs, `flow_graph.json`, `run_dossiers.jsonl`, `summary.json` |
-| `cig.html` | self-contained network viewer (no network access needed) |
-| `REPORT.md`, `REPORT.docx` | one-page scorecard and explanation |
+| `scorecard.html` | one-page scorecard: goals reached, error rate, latency, cost per run, the user-goal problem, and what System 5 gives you |
+| `cig.html` | self-contained failure network (no network access needed) |
+
+Everything else in the folder is a working file: `mapping_rescue/`, `mapping.json`, `normalized/`, `grading/`, `scores.csv`, `cig/`, `checks/`, `scorecard_inputs/`, `scorecard.json`, `status.json`, `cleaning_report.md`. The study is temporary and is deleted when the pages are built.
 
 ## Data requirements
 
-None are hard blockers. Missing pieces degrade the output and are reported:
+Nothing is a hard blocker; a missing field leaves that dimension out or marks the affected runs unusable.
 
 | Missing | Effect |
 |---|---|
-| Timestamps | latency dimension dropped |
-| Tokens / cost | tokens estimated (chars/4, flagged); dollars need prices |
-| Error field | errors derived from result text and status |
-| Tool calls | scorecard only; CIG has just an agent node |
-| Run / conversation id | synthesized (hash; session, trace, or time gap) |
-| User message or answer | best available text; run marked "thin" |
+| Timestamps | latency is left out |
+| Tokens / cost | tokens are estimated; dollars need prices |
+| Error field | errors are derived from result text and status |
+| Tool calls | the network has just an agent node |
+| Run / conversation id | derived from session, trace or time gap |
+| User message | the run is unusable |
 
 Only an empty or unreadable input stops the pipeline, with a one-line message.
 
 ## Limits
 
-Labels are model judgements about whether the user's goal was met, not user satisfaction. Estimates (goal reach, ~50% cost reduction, error and latency) are bounds, not forecasts. Small samples give wide uncertainty. Results cover only the data you provide.
+Labels are model judgements about whether the user's goal was met, not user satisfaction, and different models can differ slightly. The System 5 figures are claims and conservative estimates from your data, not forecasts. Small samples are noisy. By default up to 300 runs are graded. Results cover only the data you provide.
 
 ## Test
 

@@ -1,5 +1,5 @@
 ---
-description: Build the CIG (graph csvs, flow_graph.json, run dossiers) and the viewer
+description: Build cig.html from graded runs (CIG, then verify)
 ---
 
-Use the procept-lite skill, one-action path step 4 (cig then viewer). If scores.csv is missing, run the full one-action path instead of stopping. Output dir: `./procept-out` unless the user names one. Arguments from the user: $ARGUMENTS
+Use the procept-lite skill. Run `plite.py run` and follow its NEXT lines through `cig_verify`; `cig.html` is built with the scorecard at the end of the loop. If earlier stages are missing, do them first rather than stopping. Output dir: `./procept-out` unless the user names one. Arguments from the user: $ARGUMENTS

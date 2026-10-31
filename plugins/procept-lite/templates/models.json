@@ -1,0 +1,5 @@
+{
+  "_": "Model floor for every judgement step (mapping rescue, grading, verification, study). Matching is on the lowercased id with spaces, underscores and dots turned into dashes. Add newer, stronger ids here; never add small models.",
+  "allow": ["sonnet-5-5", "opus-5-5", "fable-5-1", "gpt-5-6-terra"],
+  "deny": ["haiku", "mini", "nano", "flash", "lite", "small", "tiny", "instant"]
+}

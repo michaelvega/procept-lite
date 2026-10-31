@@ -5,17 +5,22 @@ Usage:
                               [--prices prices.json] [--noise-regex RE] [--tool-regex RE] [--out DIR]
 
 Layers (see ingest.py, schema.py, cleaning.py): decode -> parse -> flatten -> lift provider shapes (Cloud Logging,
-Bedrock, X-Ray, Jaeger, Zipkin, ADK, OpenAI/Anthropic messages ...) -> infer a mapping for unknown schemas
-(<out>/mapping.auto.json) -> map -> repair -> validate. Gaps degrade the analysis instead of blocking it (no times:
-latency dropped; no tokens: chars/4 estimate flagged; no error field: errors derived from result text; missing
-user/answer: run marked thin) and every drop/repair/assumption is counted in <out>/cleaning_report.md.
+Bedrock, X-Ray, Jaeger, Zipkin, ADK, OpenAI/Anthropic messages ...) -> map -> repair -> validate. Gaps degrade the
+analysis instead of blocking it (no times: latency dropped; no tokens: chars/4 estimate flagged; no error field: errors
+derived from result text; missing user/answer: run marked thin) and every drop/repair/assumption is counted in
+<out>/cleaning_report.md.
+
+The mapping is never guessed. `plite.py scaffold` writes a heuristic DRAFT (<out>/mapping_rescue/mapping.draft.json)
+plus a raw sample; a model (Sonnet 5.5 / GPT 5.6 Terra or better) compares the draft with real rows and writes
+<out>/mapping.json (or pass --map) with a _rescue block {model, rows_reviewed, notes}. Normalize refuses to run
+without it. The heuristic code below is a starter the rescue model reads and edits, not a decision.
 
 Input formats (auto-detected per record; JSON array / JSON object / JSONL / CSV / TSV, .gz ok, dirs recursive)
   1. otel      OpenTelemetry GenAI span rows (Logfire, Pydantic AI, OTel exporters, Azure Monitor / App Insights,
                GCP Cloud Trace, AWS X-Ray / CloudWatch / AgentCore once exported as span rows). Attributes may be a
                JSON string, a dict, an OTLP key/value list, or flattened columns (gen_ai.*).
   2. langsmith LangSmith / LangChain runs export (run_type llm|tool|chain|retriever, inputs/outputs, error, ...).
-  3. flat      any table, via --map mapping.json. Mapping keys (all optional, values are column names):
+  3. flat      any table, via the rescued mapping.json. Mapping keys (all optional, values are column names):
                  run_id, conversation_id, trace_id, span_id, parent_id,
                  timestamp, end_timestamp, timestamp_format (strptime), duration_s | duration_ms,
                  role (user|assistant|tool|system), content,
@@ -50,6 +55,7 @@ Heuristics (all of them)
   * latency_s = root agent span duration, else last end - first start.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -57,10 +63,12 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (MISSING, Span, add_ingest_args, clip, find_key, iso, iter_records, jloads, last_text,  # noqa: E402
-                    load_json_file, otlp_attrs, parse_duration_s, pick, redact_secrets, to_epoch, to_float, to_int,
-                    to_str, to_tokens, ok_dur, is_error_literal, real_error, write_json)
+from common import (MISSING, Span, add_ingest_args, clip, find_key, iso, iter_files, iter_records, jloads,  # noqa: E402
+                    last_text, load_json_file, otlp_attrs, parse_duration_s, pick, redact_secrets, to_epoch, to_float,
+                    to_int, to_str, to_tokens, ok_dur, is_error_literal, real_error, write_json)
 from common import redact  # noqa: E402
+import common  # noqa: E402
+import checks  # noqa: E402
 import cleaning as CL  # noqa: E402
 import schema as SC  # noqa: E402
 
@@ -120,20 +128,86 @@ class Opts(object):
         self.noise_re = re.compile(noise_regex) if noise_regex else None
         self.tool_re = re.compile(tool_regex) if tool_regex else None
         self.dur_unit = None
+        self.preview = False  # scaffold's draft preview only: the mapping-rescue rule is not enforced, nothing is kept
+
+
+def mapping_path_for(a):
+    """The mapping file in play: --map, else <out>/mapping.json when it exists, else None."""
+    mp = getattr(a, "mapping", None)
+    out = getattr(a, "out", None)
+    if not mp and out and os.path.isfile(os.path.join(out, "mapping.json")):
+        mp = os.path.join(out, "mapping.json")
+    return mp
+
+
+def _adopt_mapping(mp, out):
+    """A --map file outside <out> is copied to <out>/mapping.json, the file the ingest sign-off covers."""
+    if not (mp and out):
+        return
+    dest = os.path.join(out, "mapping.json")
+    if os.path.abspath(mp) == os.path.abspath(dest):
+        return
+    with open(mp, encoding="utf-8-sig") as f:
+        text = f.read()
+    try:
+        with open(dest, encoding="utf-8") as f:
+            if f.read() == text:
+                return
+    except OSError:
+        pass
+    checks.atomic_write(dest, text)
 
 
 def opts_from_args(a):
+    """Options from the command line. Strict (the default): a mapping with a valid _rescue block is required, from
+    --map or <out>/mapping.json; anything else is refused with one message saying what to do."""
+    out = getattr(a, "out", None)
+    mp = mapping_path_for(a)
     mapping = None
-    mp = getattr(a, "mapping", None)
-    if not mp and getattr(a, "out", None) and os.path.isfile(os.path.join(a.out, "mapping.json")):
-        mp = os.path.join(a.out, "mapping.json")
     if mp:
         try:
             mapping = load_json_file(mp)
         except (OSError, ValueError):
             raise ValueError("mapping file %s is not valid JSON" % os.path.basename(mp))
+    if common.strict():
+        problem = common.no_mapping_message(out) if not mp else common.rescue_problem(mapping)
+        if problem:
+            raise common.RescueError(problem)
+        _adopt_mapping(mp, out)
     prices = load_json_file(a.prices) if getattr(a, "prices", None) else None
     return Opts(a.format, mapping, prices, getattr(a, "noise_regex", None), getattr(a, "tool_regex", None))
+
+
+def files_sig(paths):
+    """Hash of the source files themselves (path, size, mtime)."""
+    h = hashlib.sha256()
+    try:
+        files = iter_files(paths)
+    except FileNotFoundError:
+        files = []
+    for f in files:
+        try:
+            st = os.stat(f)
+            h.update(("%s|%d|%d\n" % (os.path.abspath(f), st.st_size, st.st_mtime_ns)).encode("utf-8", "replace"))
+        except OSError:
+            h.update(("gone|%s\n" % f).encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def source_sig(paths, a):
+    """One hash over everything that decides the content of normalized/runs.jsonl: the source files, the mapping, the
+    prices and the filter options. `run` re-normalizes only when it changes."""
+    h = hashlib.sha256()
+    h.update(files_sig(paths).encode())
+    for label, p in (("map", mapping_path_for(a)), ("prices", getattr(a, "prices", None))):
+        h.update(label.encode())
+        try:
+            with open(p, "rb") as f:
+                h.update(f.read())
+        except (OSError, TypeError):
+            h.update(b"-")
+    h.update(repr((getattr(a, "format", None), getattr(a, "noise_regex", None), getattr(a, "tool_regex", None))).encode())
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------- helpers
@@ -559,38 +633,48 @@ def _sample_duration_unit(raws):
 
 def _no_runs_message(stats, mapping_notes, raw_cols):
     cols = ", ".join(clip(redact(str(c)), 40) for c in list(raw_cols)[:15]) or "none"
-    return ("no usable columns found. Columns seen: %s. Point the pipeline at the right fields: write mapping.json "
-            "with keys user_text (the user's question), answer_text (the agent's reply) and optionally run_id, "
-            "conversation_id, timestamp, tools, then re-run with --map mapping.json (see templates/mapping.example.json)."
-            % cols)
+    return ("no usable columns found. Columns seen: %s. Point the pipeline at the right fields: run `plite.py scaffold` and "
+            "follow mapping_rescue/README.md to write mapping.json with keys user_text (the user's question), answer_text "
+            "(the agent's reply) and optionally run_id, conversation_id, timestamp, tools (pass it with --map mapping.json "
+            "or keep it in the output folder; see templates/mapping.example.json)." % cols)
 
 
-def load_spans(paths, opts, keep_stats=True):
+def load_spans(paths, opts, keep_stats=True, recs=None):
     """Parse every record. Returns (spans, stats). Noise ("other" kind or --noise-regex) is dropped and counted.
-    Layers: read -> lift provider shapes -> infer mapping for unknown shapes -> parse -> dedupe."""
+    Layers: read -> lift provider shapes -> map (the rescued mapping.json) -> parse -> dedupe.
+    Every span carries .src, the index of the raw record it came from (scaffold turns that into locators).
+    `recs` lets scaffold hand over records it has already read."""
     CL.CR.reset()
     stats = {"records": 0, "duplicates": 0, "noise_dropped": 0, "unknown_records": 0, "formats": Counter(),
              "columns": Counter(), "attr_keys": Counter(), "bad_lines": 0, "auto_mapping": None}
-    recs = list(iter_records(paths, stats))
+    if recs is None:
+        recs = list(iter_records(paths, stats))
     stats["records"] = len(recs)
-    items = []
+    if common.strict() and not opts.preview:  # no path applies a guessed mapping: it must carry a model's _rescue block
+        problem = (common.no_mapping_message() if not isinstance(opts.mapping, dict)
+                   else common.rescue_problem(opts.mapping, len(recs)))
+        if problem:
+            raise common.RescueError(problem)
+        CL.note("mapping_rescue", 1, "model %s, %d raw rows reviewed" % (
+            opts.mapping["_rescue"]["model"], opts.mapping["_rescue"]["rows_reviewed"]))
+    items = []  # (kind, record, index of the raw record in recs)
     forced = opts.fmt if opts.fmt in ("otel", "langsmith") else None
     user_map = opts.mapping if isinstance(opts.mapping, dict) else None
-    for rec in recs:
+    for ri, rec in enumerate(recs):
         if len(stats["columns"]) < 400 and stats["records"] <= 2000 or sum(stats["columns"].values()) < 60000:
             stats["columns"].update(rec.keys())
         if forced:
-            items.append((forced, rec))
+            items.append((forced, rec, ri))
         elif user_map is not None and user_map.get("format") in (None, "flat"):
-            items.append(("raw", rec))
+            items.append(("raw", rec, ri))
         else:
-            items.extend(SC.lift(rec))
-    raws = [r for k, r in items if k == "raw"]
+            items.extend((k, r, ri) for k, r in SC.lift(rec))
+    raws = [r for k, r, _ in items if k == "raw"]
     mapping, auto = None, False
     if raws:
         if user_map is not None:
             mapping = user_map
-        else:
+        else:  # only reachable under the dev bypass: the heuristic draft is applied directly
             mapping, notes, ok = SC.infer(raws)
             if ok:
                 auto = True
@@ -604,7 +688,7 @@ def load_spans(paths, opts, keep_stats=True):
             fm = mapping.get("rename") or {}
             kind = mapping["format"]
             CL.note("renamed_columns", len(raws))
-            items = [((kind, _rename(r, fm)) if k == "raw" else (k, r)) for k, r in items]
+            items = [((kind, _rename(r, fm), ri) if k == "raw" else (k, r, ri)) for k, r, ri in items]
             if auto:
                 stats["auto_mapping"] = mapping
             mapping = None
@@ -612,7 +696,7 @@ def load_spans(paths, opts, keep_stats=True):
             stats["auto_mapping"] = mapping
     _sort_events(items)
     if opts.dur_unit is None:
-        opts.dur_unit = _sample_duration_unit([r for k, r in items if k == "otel"])
+        opts.dur_unit = _sample_duration_unit([r for k, r, _ in items if k == "otel"])
     flat_map = mapping if mapping is not None else {}
     if flat_map.get("duration_s") and flat_map.get("duration_unit") in (None, "auto"):
         vals = sorted(v for v in (to_float(SC.get_path(r, flat_map["duration_s"])) for r in raws[:500])
@@ -628,7 +712,7 @@ def load_spans(paths, opts, keep_stats=True):
     ctx = SC.Ctx()
     seq_in = 0
     unit = opts.dur_unit
-    for kind, rec in items:
+    for kind, rec, ri in items:
         seq_in += 1
         if kind == "raw" and mapping is None:
             stats["unknown_records"] += 1
@@ -659,6 +743,7 @@ def load_spans(paths, opts, keep_stats=True):
         else:
             new = SC.parse_flat(rec, flat_map, seq_in, ctx, unit)
         for s in new:
+            s.src = ri
             if s.kind == "other" or (opts.noise_re and opts.noise_re.search(s.name or "")):
                 stats["noise_dropped"] += 1
                 continue
@@ -695,7 +780,7 @@ _EV_RANK = {"user": 0, "tool_call": 1, "tool_result": 2, "llm": 2, "assistant": 
 def _sort_events(items):
     """Event rows (tool call / result / user / final) that arrive out of time order are sorted by time (ties by
     logical order) so tool calls pair with their results and turns do not mix. Other items keep their place."""
-    idx = [i for i, (k, r) in enumerate(items) if k == "canon" and isinstance(r, dict) and r.get("event") in _EV_RANK]
+    idx = [i for i, (k, r, _) in enumerate(items) if k == "canon" and isinstance(r, dict) and r.get("event") in _EV_RANK]
     if len(idx) < 2:
         return
     keyed = []
@@ -1092,16 +1177,22 @@ def _synth_conversations(runs):
     CL.note("conversation_synthesized", len(pend))
 
 
-def build_runs(spans, opts):
-    """Return the list of run dossiers sorted by first_ts."""
+def build_runs(spans, opts, locate=None):
+    """Return the list of run dossiers sorted by first_ts. When `locate` is a dict it receives
+    {run_id: sorted indices of the raw records the run was built from} (scaffold's source locators)."""
     groups = resolve_runs(spans)
     runs = [build_run(k, g[0], g[1], opts) for k, g in groups.items()]
     runs = [r for r in runs if r["extra"]["spans"]]
+    if locate is not None:
+        for r in runs:
+            r["extra"]["_src"] = sorted({s.src for s in groups[r["run_id"]][1] if s.src is not None})
     _synth_ids(runs, groups)
     _synth_conversations(runs)
     for r in runs:
         if not r["conversation_id"]:
             r["conversation_id"] = r["run_id"]
+        if locate is not None:
+            locate[r["run_id"]] = r["extra"].pop("_src", [])
     runs.sort(key=lambda r: (r["first_ts"] or "~", r["run_id"]))
     orphan = 0
     for g in groups.values():
@@ -1135,25 +1226,35 @@ def run_all(paths, opts):
     return build_runs(spans, opts), spans, stats
 
 
-def write_outputs(out, runs, spans, stats):
-    """runs.jsonl, ingest_stats.json, mapping.auto.json, cleaning_report.md."""
+def write_outputs(out, runs, spans, stats, sig=None):
+    """normalized/runs.jsonl (via a temp file and a rename), ingest_stats.json (+ source_sig when given) and, when the
+    starter heuristics were applied directly (dev bypass), the draft they used: mapping_rescue/mapping.draft.json."""
     os.makedirs(os.path.join(out, "normalized"), exist_ok=True)
     path = os.path.join(out, "normalized", "runs.jsonl")
-    with open(path, "w", encoding="utf-8") as f:
-        for r in runs:
-            f.write(json.dumps(r, ensure_ascii=False, allow_nan=False, default=str) + "\n")
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in runs:
+                f.write(json.dumps(r, ensure_ascii=False, allow_nan=False, default=str) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     dims = finalize_dimensions(runs)
     summ = {"records": stats["records"], "spans_kept": len(spans), "duplicates_dropped": stats["duplicates"],
             "noise_dropped": stats["noise_dropped"], "unknown_records": stats["unknown_records"],
             "unreadable": stats["unknown_records"] + stats["bad_lines"],
             "runs": len(runs), "conversations": len({r["conversation_id"] for r in runs}),
             "formats": dict(stats["formats"]), "dimensions": dims}
+    if sig:
+        summ["source_sig"] = sig
     write_json(os.path.join(out, "normalized", "ingest_stats.json"), summ)
     if stats.get("auto_mapping"):
         am = dict(stats["auto_mapping"])
-        am["_comment"] = ("scaffolded by heuristics from column names and value shapes; edit and pass with --map "
-                          "to override")
-        write_json(os.path.join(out, "mapping.auto.json"), am)
+        am["_comment"] = ("starter draft from column names and value shapes; a model reviews it against raw rows and "
+                          "writes mapping.json (see README.md in this folder)")
+        write_json(os.path.join(out, "mapping_rescue", "mapping.draft.json"), am)
     return path, summ
 
 
@@ -1177,7 +1278,7 @@ def main(argv=None):
                                  stats["records"], dict(stats["formats"]),
                                  os.path.join(a.out, "cleaning_report.md"))), file=sys.stderr)
         return 2
-    path, summ = write_outputs(a.out, runs, spans, stats)
+    path, summ = write_outputs(a.out, runs, spans, stats, source_sig(a.src, a))
     CL.CR.write(a.out)
     print("normalized %d runs (%d conversations) from %d records -> %s" % (
         len(runs), summ["conversations"], stats["records"], path))

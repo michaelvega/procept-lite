@@ -67,7 +67,8 @@ KINDS = {
     "hierarchy_from_dotted_order": ("repair", "trace and parent ids derived from LangSmith dotted_order"),
     "id_collision": ("assumption", "ids reused by different records (kept apart by trace/content)"),
     # ---- schema / mapping
-    "auto_mapping": ("assumption", "tables with an unknown schema scaffolded by heuristics (see mapping.auto.json)"),
+    "auto_mapping": ("assumption", "tables with an unknown schema mapped by the starter heuristics (draft: mapping_rescue/mapping.draft.json)"),
+    "mapping_rescue": ("assumption", "mapping written by a model after it reviewed raw rows against the draft (mapping rescue)"),
     "format_lifted": ("repair", "provider-specific records converted to the canonical shape"),
     "renamed_columns": ("repair", "span tables with renamed columns mapped to the canonical fields"),
     "unknown_records": ("drop", "records that matched no known schema and no inferable mapping"),
@@ -87,6 +88,9 @@ KINDS = {
     "errors_from_text": ("assumption", "tool calls marked failed from error patterns in their result text (no error field)"),
     "field_truncated": ("repair", "oversized text fields truncated"),
     "secrets_redacted": ("repair", "API keys/passwords/tokens replaced by [secret] in the run dossiers"),
+    # ---- unusable runs (kept out of grading, the CIG and the scorecard; see normalized/unusable.csv)
+    "unusable_no_ask": ("drop", "runs with an empty user message (unusable: no_ask)"),
+    "unusable_model": ("drop", "runs the ingest check marked unusable because a field could not be trusted (reason in details)"),
     # ---- dimensions
     "dimension_dropped": ("assumption", "analysis dimension dropped because the data has nothing for it"),
 }
@@ -172,3 +176,41 @@ CR = Report()
 
 def note(kind, n=1, detail=None):
     CR.note(kind, n, detail)
+
+
+def unusable_kind(reason, source):
+    """Ledger kind for one unusable run: the code rule `no_ask` has its own kind, model reasons share one."""
+    return "unusable_no_ask" if (source == "auto" and reason == "no_ask") else "unusable_model"
+
+
+def write_section(out, title, report):
+    """Replace (or append) the section `title` of <out>/cleaning_report.md with the counts in `report` (a Report).
+    Later stages (grade-prepare) add their numbers this way; the rest of the file is left alone."""
+    path = os.path.join(out, "cleaning_report.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = "# Cleaning report\n\n"
+    start, end = "<!-- section: %s -->" % title, "<!-- /section: %s -->" % title
+    i = text.find(start)
+    if i >= 0:
+        j = text.find(end, i)
+        text = text[:i].rstrip("\n") + "\n" + (text[j + len(end):].lstrip("\n") if j >= 0 else "")
+    lines = [start, "## %s" % title, ""]
+    if report.counts:
+        lines += ["| kind | what | count |", "|---|---|---|"]
+        for k, n in sorted(report.counts.items()):
+            cat, what = KINDS.get(k, ("repair", k))
+            lines.append("| %s: %s | %s | %d |" % (cat, k, what, n))
+        lines.append("")
+        for k, v in report.details.items():
+            if v:
+                lines.append("- %s: %s" % (k, "; ".join(v)))
+        lines.append("")
+    else:
+        lines += ["Nothing to report.", ""]
+    lines.append(end)
+    from checks import atomic_write
+    atomic_write(path, text.rstrip("\n") + "\n\n" + "\n".join(lines) + "\n")
+    return path

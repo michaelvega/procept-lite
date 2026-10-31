@@ -1,6 +1,7 @@
 """Fuzz regression: every fixture produced by tests/fuzz/*/gen.py must go through `plite.py run` without a
 traceback, reach a CIG input (runs.jsonl + cleaning_report.md) with exit 0, except inputs that are truly
 empty/unreadable, which must fail with exit 2 and a one-line human message (stdlib unittest)."""
+import csv
 import glob
 import json
 import os
@@ -19,6 +20,21 @@ UNREADABLE = re.compile(r"empty|garbage|junk|array_of|header_only|whitespace|zer
                         r"null|html|secret_filename|truncated_zip|resourcespans|deep_nesting|text_only|only_bom|"
                         r"only_header|numeric_only", re.I)
 SECRETS = re.compile(r"@example\.com|sk-[A-Za-z0-9]{12}")
+
+
+_GATE = {}
+
+
+def setUpModule():  # these tests exercise the stages themselves, not the sign-off gates (test_gates.py covers those)
+    _GATE["old"] = os.environ.get("PLITE_NO_GATE")
+    os.environ["PLITE_NO_GATE"] = "1"
+
+
+def tearDownModule():
+    if _GATE.get("old") is None:
+        os.environ.pop("PLITE_NO_GATE", None)
+    else:
+        os.environ["PLITE_NO_GATE"] = _GATE["old"]
 
 
 def gen_dirs(source_dir):
@@ -87,12 +103,16 @@ class FuzzCorpus(unittest.TestCase):
                 self.assertTrue(os.path.isfile(runs))
                 with open(runs, encoding="utf-8") as f:
                     self.assertGreater(sum(1 for _ in f), 0)
-                self.assertTrue(os.path.isfile(os.path.join(out, "grading", "workflow_args.json")))
+                if not os.path.isfile(os.path.join(out, "grading", "workflow_args.json")):
+                    # every run was classified unusable (no user message): nothing to grade, and the ledger says so
+                    with open(os.path.join(out, "normalized", "unusable.csv"), encoding="utf-8", newline="") as f:
+                        self.assertEqual(sum(1 for _ in csv.DictReader(f)), sum(1 for ln in open(runs, encoding="utf-8")
+                                                                                  if ln.strip()))
 
     def test_scored_runs_reach_the_cig(self):
         """With scores present, run continues to cig + viewer + report on a sample of the corpus."""
-        import csv
-        good = [(s, p, out) for s, p, out, r in self.results if r.returncode == 0][::6]
+        good = [(s, p, out) for s, p, out, r in self.results
+                if r.returncode == 0 and os.path.isfile(os.path.join(out, "grading", "workflow_args.json"))][::6]
         self.assertGreater(len(good), 10)
         for source, path, out in good:
             with self.subTest(case="%s/%s" % (source, os.path.basename(path))):
@@ -108,7 +128,7 @@ class FuzzCorpus(unittest.TestCase):
                                    capture_output=True, text=True, timeout=900)
                 self.assertNotIn("Traceback", r.stdout + r.stderr)
                 self.assertEqual(r.returncode, 0, r.stderr)
-                for name in ("cig.html", "REPORT.md"):
+                for name in ("cig.html", os.path.join("cig", "flow_graph.json")):
                     self.assertTrue(os.path.isfile(os.path.join(out, name)), name)
 
 

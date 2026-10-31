@@ -19,6 +19,21 @@ import ingest  # noqa: E402
 import normalize as N  # noqa: E402
 
 
+_GATE = {}
+
+
+def setUpModule():  # these tests exercise the stages themselves, not the sign-off gates (test_gates.py covers those)
+    _GATE["old"] = os.environ.get("PLITE_NO_GATE")
+    os.environ["PLITE_NO_GATE"] = "1"
+
+
+def tearDownModule():
+    if _GATE.get("old") is None:
+        os.environ.pop("PLITE_NO_GATE", None)
+    else:
+        os.environ["PLITE_NO_GATE"] = _GATE["old"]
+
+
 def span_rows(n=4, with_time=True, with_tokens=True, tool_result="ok"):
     rows = []
     for i in range(n):
@@ -205,12 +220,13 @@ class Degradation(Base):
         self.assertTrue(all(r["run_id"].startswith("run-") for r in a))
         self.assertEqual(len({r["conversation_id"] for r in a}), 1)  # no conversation id: one by time gap
 
-    def test_unknown_schema_is_scaffolded(self):
+    def test_unknown_schema_uses_the_starter_draft(self):
         rows = [{"foo": "run%d" % i, "bar": "question number %d" % i, "baz": "answer number %d" % i, "qux": i * 1.5}
                 for i in range(6)]
         runs, rep, out = self.run_rows(rows)
         self.assertEqual(len(runs), 6)
-        with open(os.path.join(out, "mapping.auto.json")) as f:
+        self.assertFalse(os.path.exists(os.path.join(out, "mapping.json")))
+        with open(os.path.join(out, "mapping_rescue", "mapping.draft.json")) as f:
             m = json.load(f)
         self.assertEqual((m["user_text"], m["answer_text"], m["run_id"]), ("bar", "baz", "foo"))
         self.assertIn("auto_mapping", rep)
@@ -257,7 +273,7 @@ class Degradation(Base):
                 w.writerow([x["run_id"], [1, 0, -1][i % 3], "high", "why", "", "analyst", "", ""])
         r, out = self.cli(p)
         self.assertEqual(r.returncode, 0, r.stderr)
-        for k in ("cig/flow_graph.json", "cig.html", "REPORT.md"):
+        for k in ("cig/flow_graph.json", "cig.html"):
             self.assertTrue(os.path.isfile(os.path.join(out, k)), k)
 
 

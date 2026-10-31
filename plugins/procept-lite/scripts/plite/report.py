@@ -1,379 +1,616 @@
-"""Write the one-page REPORT.md and REPORT.docx from cig/ (+ scores.csv)."""
+"""scorecard.html + scorecard.json: the customer-facing page of a run.
+
+  python3 plite.py report --out DIR [--keep-study] [--validate-problem]
+
+Flow: gates (ingest, merge, cig, study) -> validate_problem -> numbers (scorecard.py) -> System 5 rows
+(estimates.py) -> fill the template -> lint_customer_html (a hit fails the build) -> write -> delete <out>/study.
+
+The words come from the template and from <out>/scorecard_inputs/user_goal_problem.json (written by a model that
+read the runs); this file only computes numbers, draws the bars and refuses anything that would look wrong.
+A copy of the template at <out>/scorecard.template.html takes precedence over templates/scorecard.template.html.
+"""
 import argparse
-import glob
+import datetime
+import html
+import json
 import math
 import os
 import re
 import shutil
-import string
-import subprocess
 import sys
-import tempfile
+from collections import Counter
+from html.parser import HTMLParser
 
 try:
+    from . import checks
     from . import estimates as est
     from . import scorecard as scm
-    from .docx_writer import write_docx
+    from .common import redact
 except ImportError:  # imported as a top-level module
+    import checks
     import estimates as est
     import scorecard as scm
-    from docx_writer import write_docx
+    from common import redact
 
-MAX_BODY_WORDS = 460
-PAGE_PT = (15840 - 2 * 1008) / 20.0  # printable height in points
-DEFAULT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                                "templates", "report.template.md")
-FOOTER = ("Labels are reader-agent judgements of whether the user's goal was met, not user "
-          "satisfaction. Estimates are bounds derived from these runs, not forecasts.")
-
-
-def _p(x):
-    return "%d%%" % round(x)
-
-
-def _n(x):
-    return "{:,}".format(int(round(x)))
+TITLE = "Agent Run Scorecard"
+HERE = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE = os.path.join(HERE, "..", "..", "templates", "scorecard.template.html")
+PROBLEM_FILE = os.path.join("scorecard_inputs", "user_goal_problem.json")
+STUDY_MARKER = ".procept-lite-study"
+GATES = ["ingest", "merge", "cig", "study"]
+NB = "\u00a0"
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+CLS = {"good": "good", "ambiguous": "amb", "bad": "bad"}
+NAME = {"good": "Good", "ambiguous": "Ambiguous", "bad": "Bad"}
+E = lambda s: html.escape(str(s), quote=True)  # noqa: E731
 
 
-def _pl(n, word, plural=None):
-    """pluralize: '1 run', '2 runs'."""
-    return "%s %s" % (_n(n), word if n == 1 else plural or word + "s")
+# ------------------------------------------------------------ numbers as text
+def fmt_int(n):
+    return "{:,}".format(int(round(n)))
 
 
-def _tok(x):
-    if x is None:
-        return "-"
-    if x >= 1e6:
-        return "%.1fM" % (x / 1e6)
-    return "%.1fk" % (x / 1000.0) if x >= 1000 else str(int(round(x)))
+def plural(n, word):
+    return "%s %s%s" % (fmt_int(n), word, "" if int(round(n)) == 1 else "s")
 
 
-def _sec(x):
-    if x is None:
-        return "-"
-    if x >= 3600:
-        return "%.1fh" % (x / 3600.0)
-    if x >= 90:
-        return "%.1fm" % (x / 60.0)
-    return "%.1fs" % x
+def _trim(s):
+    return s.rstrip("0").rstrip(".") if "." in s else s
 
 
-def _cut(s, k):
-    s = " ".join(str(s).split())
-    return s if len(s) <= k else s[:max(k - 3, 1)].rstrip() + "..."
+def fmt_pct(v):
+    """7.2%, 48%, 0.05%: one decimal below 10, whole numbers above; never rounds up to 100%."""
+    if v <= 0:
+        return "0%"
+    if v < 0.01:
+        return "<0.01%"
+    if v < 0.1:
+        return "%.2f%%" % v
+    if v < 10 or 99.5 <= v < 100:
+        return _trim("%.1f" % v) + "%"
+    return "%d%%" % round(v)
 
 
-# ---------------------------------------------------------------- content
-def metrics_table(sc):
-    cols = [("Good", sc["by"]["good"]), ("Ambiguous", sc["by"]["ambiguous"]),
-            ("Bad", sc["by"]["bad"]), ("All runs", sc["all"])]
-    if not sc["graded"]:
-        cols = [("All runs", sc["all"])]
-    n = sc["n"]
-    cost = sc["has_cost"]
-
-    def row(label, f):
-        return [label] + [f(g) if g["n"] else "-" for _, g in cols]
-
-    rows = [["Metric"] + [c for c, _ in cols],
-            row("Runs", lambda g: "%d (%s)" % (g["n"], _p(scm.pct(g["n"], n)))),
-            row("Errors: runs with a tool failure", lambda g: _p(g["tool_fail_pct"])),
-            row("Errors: last call failed", lambda g: _p(g["unrecovered_pct"])),
-            row("Errors: ended with no answer", lambda g: _p(g["no_answer_pct"])),
-            row("Cost: median tokens" + (" ($)" if cost else ""),
-                lambda g: "-" if g["median_tokens"] is None else _tok(g["median_tokens"]) + (
-                    " ($%.3f)" % g["median_cost"] if g["median_cost"] is not None else "")),
-            row("Cost: median tool calls", lambda g: "%g" % g["median_tools"]),
-            row("Latency: median", lambda g: _sec(g["median_latency"])),
-            row("Latency: in slowest decile",
-                lambda g: _p(g["slow_pct"]) if g["median_latency"] is not None else "-")]
-    return rows
+def fmt_usd(v):
+    """$20.96, $0.17, $0.085: two significant digits below a dollar."""
+    if v <= 0:
+        return "$0"
+    if v >= 100:
+        return "$" + fmt_int(v)
+    if v >= 1:
+        return "$%.2f" % v
+    if v < 0.00005:
+        return "<$0.0001"
+    return "$%.*f" % (1 - int(math.floor(math.log10(v))), v)
 
 
-def personas_table(sc, goal_len=48, pain_len=44):
-    if not sc["graded"]:
-        return None
-    rows = [["Buyer persona", "Runs", "Goal (common ask)", "Fell short", "Top pain"]]
-    for p in sc["personas"]:
-        rows.append([_cut(p["persona"], 44), str(p["n"]), _cut(p["goal"], goal_len) or "-",
-                     _p(p["fell_short_pct"]), _cut(p["top_pain"], pain_len) or "-"])
-    return rows
+def fmt_tokens(v):
+    """Tokens as k or M: 662k, 9.5k, 1.4M."""
+    if v < 1000:
+        return "%d" % round(v)
+    if v < 999500:
+        k = v / 1e3
+        return _trim("%.1f" % k) + "k" if k < 10 else "%dk" % round(k)
+    m = v / 1e6
+    return _trim("%.1f" % m) + "M" if m < 10 else "%dM" % round(m)
 
 
-def reach_lines(sc):
-    g, c, e, l = est.goals(sc), est.cost(sc), est.errors(sc), est.latency(sc)
-    L = []
-    if g:
-        L.append("**User goals:** good share is %s now. If all %s bad or ambiguous with a "
-                 "mechanical problem (tool failure, no answer, heavy or slow) were fixed it would "
-                 "be at most %s; fixing half of them gives about %s."
-                 % (_p(g["now"]), _pl(g["addressable"], "run"), _p(g["ceiling"]), _p(g["half"])))
+def fmt_num(v):
+    return _trim("%.1f" % v)
+
+
+def fmt_calls(v):
+    return fmt_num(v) if v < 10 else "%d" % round(v)
+
+
+def fmt_seconds(s):
+    """-> (number, unit): 7.2 s, 79 s, 2.4 min, 1.6 h."""
+    if s < 90:
+        v, u = s, "s"
+    elif s < 5400:
+        v, u = s / 60.0, "min"
     else:
-        L.append("**User goals:** not graded yet, so no goal-reach bound; run the grading step.")
-    if c:
-        spend = "%s tokens" % _tok(c["total"])
-        if c["cost_total"] is not None:
-            spend += " ($%.2f)" % c["cost_total"]
-        if c["graded"]:
-            sup = ("A 50%% cut is supported by the data (levers reach %s)." % _p(c["union_pct"])
-                   if c["supported"] else
-                   "A 50%% cut is not supported: the levers reach only %s, %d points short."
-                   % (_p(c["union_pct"]), round(c["gap"])))
-            L.append("**Cost:** of %s, %s sit in bad or ambiguous runs, %s is excess of heavy runs "
-                     "over the median run, and about %s is spent on calls after a failure. %s "
-                     "Upper bound, levers counted once per run."
-                     % (spend, _p(c["short_pct"]), _p(c["heavy_pct"]), _p(c["retry_pct"]), sup))
-        else:
-            sup = ("supported" if c["heavy_pct"] + c["retry_pct"] >= 50 else "not supported")
-            L.append("**Cost:** of %s, %s is excess of heavy runs over the median and about %s is "
-                     "spent after a failure; a 50%% cut is %s by these two levers (not graded yet, "
-                     "so wasted-on-bad-runs is unknown)."
-                     % (spend, _p(c["heavy_pct"]), _p(c["retry_pct"]), sup))
-    else:
-        L.append("**Cost:** no token data in the runs, so no cost bound.")
-    if e:
-        after = (" to %s" % ("%.1f%%" % e["after"]) if e["after"] is not None else "")
-        if e["after"] is not None:
-            L.append("**Errors:** %.1f%% of tool calls failed (%d of %s). Fixing the top %s "
-                     "(%s) would lower this%s."
-                     % (e["now"], e["fails"], _pl(e["calls"], "tool call"),
-                        "error class" if len(e["top"]) == 1 else "%d error classes" % len(e["top"]),
-                        ", ".join(_cut(k, 24) for k, _ in e["top"]), after))
-        else:
-            L.append("**Errors:** %.1f%% of tool calls failed (%d of %s); no error classes were "
-                     "recorded, so no after-fix bound." % (e["now"], e["fails"], _pl(e["calls"], "tool call")))
-    else:
-        L.append("**Errors:** no tool calls recorded, so no error bound.")
-    if l and not l["tail"]:
-        L.append("**Latency:** median %s and p90 %s; there is no slow tail to bring down."
-                 % (_sec(l["med"]), _sec(l["p90"])))
-    elif l:
-        L.append("**Latency:** median %s and p90 %s now. If the slowest decile (%s, %s of "
-                 "total time) were brought down to the median, p90 would be %s and the median %s."
-                 % (_sec(l["med"]), _sec(l["p90"]), _pl(l["n_slow"], "run"), _p(l["slow_share"]),
-                    _sec(l["p90_after"]), _sec(l["med_after"])))
-    else:
-        L.append("**Latency:** no latency data, so no latency bound.")
-    return L
+        v, u = s / 3600.0, "h"
+    return (_trim("%.2f" % v) if v < 0.1 else _trim("%.1f" % v) if v < 10 else "%d" % round(v)), u
 
 
-def explanation(sc, nsent):
-    a, n = sc["all"], sc["n"]
-    e, l, c = est.errors(sc), est.latency(sc), est.cost(sc)
-    S = []
-    if sc["graded"]:
-        sp = sc["split"]
-        S.append("We read %s from %s: %s good, %s ambiguous and %s bad on the "
-                 "user's own goal." % (_pl(n, "run"), _pl(sc["n_conversations"], "conversation"), _p(scm.pct(sp["good"], n)),
-                                       _p(scm.pct(sp["ambiguous"], n)), _p(scm.pct(sp["bad"], n))))
-    else:
-        S.append("We read %s from %s; they are not graded yet, so goal "
-                 "outcomes below are missing." % (_pl(n, "run"), _pl(sc["n_conversations"], "conversation")))
-    if e:
-        S.append("%d of %s failed; %s of runs ended on a failed call and %s ended "
-                 "without an answer." % (e["fails"], _pl(e["calls"], "tool call"), _p(a["unrecovered_pct"]),
-                                         _p(a["no_answer_pct"])))
-    if sc["graded"] and sc["by"]["bad"]["n"] and sc["by"]["good"]["n"]:
-        b, g = sc["by"]["bad"], sc["by"]["good"]
-        if b["median_tokens"] is None or g["median_tokens"] is None:
-            S.append("Bad runs use a median of %g tool calls against %g for good runs."
-                     % (b["median_tools"], g["median_tools"]))
-        else:
-            S.append("Bad runs use a median of %s tokens and %g tool calls against %s and %g for "
-                     "good runs." % (_tok(b["median_tokens"]), b["median_tools"],
-                                     _tok(g["median_tokens"]), g["median_tools"]))
-    if l and l["tail"]:
-        S.append("Median latency is %s, but the slowest tenth of runs holds %s of all time."
-                 % (_sec(l["med"]), _p(l["slow_share"])))
-    if sc["personas"]:
-        p = sc["personas"][0]
-        s = "The largest persona, %s (%s), falls short %s of the time" % (
-            _cut(p["persona"], 28), _pl(p["n"], "run"), _p(p["fell_short_pct"]))
-        S.append(s + (", mostly on \"%s\"." % _cut(p["top_pain"], 30) if p["top_pain"] else "."))
-    if c and c["graded"]:
-        S.append("Money is mostly spent where it does not pay: %s of tokens sit in bad or "
-                 "ambiguous runs." % _p(c["short_pct"]))
-    return " ".join(S[:nsent])
+def fmt_delta(d):
+    """+28.5%, minus 50%; 'no change' when there is nothing to show."""
+    if abs(d) < 0.05:
+        return "no change"
+    return ("+" if d > 0 else "\u2212") + _trim("%.1f" % abs(d)) + "%"
 
 
-def build_blocks(sc, level):
-    """level 0..4: progressively shorter text to stay on one page."""
-    nsent, nfix = [6, 5, 5, 4, 4][level], [6, 5, 4, 4, 4][level]
-    goal_len, pain_len = [62, 54, 48, 42, 38][level], [56, 50, 46, 42, 38][level]
-    title = "Agent Run Scorecard"
-    sub = "%s, %s. Unit of analysis: the run." % (_pl(sc["n"], "run"), _pl(sc["n_conversations"], "conversation"))
-    if not sc["graded"]:
-        sub += " **Not graded yet**: outcome columns and personas appear after grading."
-    B = [("title", title), ("p", sub), ("h2", "Scorecard")]
-    sp = sc["split"]
-    if sc["graded"]:
-        B.append(("p", "**Outcome split:** %d good (%s), %d ambiguous (%s), %d bad (%s)%s."
-                  % (sp["good"], _p(scm.pct(sp["good"], sc["n"])), sp["ambiguous"],
-                     _p(scm.pct(sp["ambiguous"], sc["n"])), sp["bad"],
-                     _p(scm.pct(sp["bad"], sc["n"])),
-                     "; %d ungraded" % sc["ungraded"] if sc["ungraded"] else "")))
-    B.append(("table", metrics_table(sc), None))
-    pt = personas_table(sc, goal_len, pain_len)
-    if pt:
-        B.append(("table", pt, [3, 1, 4, 1.4, 3]))
-    B.append(("h2", "What we can reach"))
-    for line in reach_lines(sc):
-        B.append(("bullet", line))
-    B.append(("h2", "What the data says"))
-    B.append(("p", explanation(sc, nsent)))
-    B.append(("h2", "How to fix it"))
-    fx = est.fixes(sc, nfix)
-    for text, k in fx:
-        B.append(("bullet", "%s. Runs touched: %d." % (text, k)))
-    if not fx:
-        B.append(("bullet", "No failure patterns found in these runs."))
-    B.append(("small", FOOTER))
-    return B
-
-
-def body_words(blocks):
-    t = 0
-    for b in blocks:
-        if b[0] != "table":
-            t += len(re.sub(r"[*`]", "", b[1]).split())
-    return t
-
-
-def est_height(blocks):
-    """Rough printed height in points (Calibri 10pt, 7.1in text width)."""
-    h = 0.0
-    cpl = 108.0
-    for b in blocks:
-        k = b[0]
-        if k == "table":
-            rows, w = b[1], b[2] or [1] * len(b[1][0])
-            tot = float(sum(w))
-            for r in rows:
-                lines = max(math.ceil(len(str(c)) / max(cpl * 1.1 * w[i] / tot - 1, 4))
-                            for i, c in enumerate(r))
-                h += lines * 10.6 + 3
-            h += 6
-        elif k == "title":
-            h += 24
-        elif k == "h2":
-            h += 20
-        else:
-            size = 9 if k == "small" else 12.3
-            h += math.ceil(len(re.sub(r"[*`]", "", b[1])) / (cpl * (1.1 if k == "small" else 1)
-                                                            - (3 if k == "bullet" else 0))) * size + 3
-    return h
-
-
-def fit(sc):
-    for level in range(5):
-        blocks = build_blocks(sc, level)
-        if body_words(blocks) <= MAX_BODY_WORDS and est_height(blocks) <= PAGE_PT * 0.95:
-            return blocks, level
-    return blocks, 4
-
-
-# ---------------------------------------------------------------- output
-def _md_table(rows):
-    esc = lambda c: str(c).replace("|", "/")
-    out = ["| " + " | ".join(esc(c) for c in rows[0]) + " |",
-           "|" + "|".join("---" for _ in rows[0]) + "|"]
-    out += ["| " + " | ".join(esc(c) for c in r) + " |" for r in rows[1:]]
-    return "\n".join(out)
-
-
-def render_md(sc, blocks, template_path=None):
-    def sect(name):  # blocks between h2 `name` and the next h2
-        res, on = [], False
-        for b in blocks:
-            if b[0] == "h2":
-                on = b[1] == name
-                continue
-            if on:
-                res.append(b)
-        return res
-
-    def txt(bs):
-        parts = []
-        for b in bs:
-            if b[0] == "small":
-                continue
-            parts.append(_md_table(b[1]) if b[0] == "table"
-                         else "- " + b[1] if b[0] == "bullet" else b[1])
-        return "\n".join(p if p.startswith("- ") else p for p in parts)
-
-    sc_blocks = sect("Scorecard")
-    tables = [b for b in sc_blocks if b[0] == "table"]
-    split = [b for b in sc_blocks if b[0] == "p"]
-    subtitle = blocks[1][1]
-    tpl_path = template_path or DEFAULT_TEMPLATE
+def fmt_dates(first, last):
+    """26-27 Oct 2026, 28 Oct - 3 Nov 2026, ... ('' when a date cannot be read)."""
     try:
-        with open(tpl_path, encoding="utf-8") as f:
-            tpl = f.read()
-    except OSError:
-        tpl = ("# $title\n\n$subtitle\n\n## Scorecard\n\n$split\n\n$metrics\n\n$personas\n\n"
-               "## What we can reach\n\n$reach\n\n## What the data says\n\n$explanation\n\n"
-               "## How to fix it\n\n$fixes\n\n*$footer*\n")
-    footer = [b for b in blocks if b[0] == "small"][0][1]
-    return string.Template(tpl).safe_substitute(
-        title=blocks[0][1], subtitle=subtitle, split=txt(split),
-        metrics=_md_table(tables[0][1]),
-        personas=("**Top buyer personas**\n\n" + _md_table(tables[1][1])) if len(tables) > 1 else "",
-        reach=txt(sect("What we can reach")), explanation=txt(sect("What the data says")),
-        fixes=txt(sect("How to fix it")), footer=footer)
+        a, b = datetime.date.fromisoformat(first), datetime.date.fromisoformat(last)
+    except ValueError:
+        return ""
+    day = lambda x: "%d %s" % (x.day, MONTHS[x.month - 1])  # noqa: E731
+    if a == b:
+        return "%s %d" % (day(a), a.year)
+    if (a.year, a.month) == (b.year, b.month):
+        return "%d\u2013%d %s %d" % (a.day, b.day, MONTHS[a.month - 1], a.year)
+    if a.year == b.year:
+        return "%s \u2013 %s %d" % (day(a), day(b), a.year)
+    return "%s %d \u2013 %s %d" % (day(a), a.year, day(b), b.year)
 
 
-def check_pages(docx_path, blocks):
-    """Real page count via soffice when present; otherwise a word/line-height estimate."""
-    exe = shutil.which("soffice") or shutil.which("libreoffice")
-    for cand in ("/Applications/LibreOffice.app/Contents/MacOS/soffice",):
-        exe = exe or (cand if os.path.exists(cand) else None)
-    if exe:
-        tmp = tempfile.mkdtemp()
-        try:
-            subprocess.run([exe, "--headless", "--convert-to", "pdf", "--outdir", tmp, docx_path],
-                           capture_output=True, timeout=120)
-            pdfs = glob.glob(os.path.join(tmp, "*.pdf"))
-            if pdfs:
-                with open(pdfs[0], "rb") as f:
-                    pages = len(re.findall(rb"/Type\s*/Page[^s]", f.read()))
-                return {"method": "soffice", "pages": pages}
-        except (OSError, subprocess.SubprocessError):
-            pass
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    h = est_height(blocks)
-    return {"method": "estimate (no soffice: words and line heights)",
-            "pages": int(math.ceil(h / PAGE_PT)), "words": body_words(blocks),
-            "fill": round(h / PAGE_PT, 2)}
+def show(unit, v):
+    """-> (plain text, html) of `v` in `unit` (pct, usd, tokens, calls, s)."""
+    if unit == "s":
+        n, u = fmt_seconds(v)
+        return n + NB + u, E(n) + "<small>" + E(u) + "</small>"
+    t = {"pct": fmt_pct, "usd": fmt_usd, "tokens": fmt_tokens, "calls": fmt_calls}[unit](v)
+    return t, E(t)
 
 
-def build(out, template=None):
+def round_shares(counts):
+    """Whole-number percentages of `counts` that add up to 100 (largest remainder)."""
+    total = sum(counts)
+    if not total:
+        return [0] * len(counts)
+    raw = [100.0 * c / total for c in counts]
+    base = [int(v) for v in raw]
+    for i in sorted(range(len(raw)), key=lambda i: (base[i] - raw[i], i))[:100 - sum(base)]:
+        base[i] += 1
+    return base
+
+
+# ------------------------------------------------------------ the one user-goal problem
+class ProblemError(SystemExit, ValueError):
+    """One line telling the host what to fix. A SystemExit and a ValueError, so either kind of caller works."""
+
+
+_FIELD_HINT = {
+    "persona": "a 2-4 word label for who this user is", "goal": "one full sentence: what this user is trying to get done",
+    "problem": "one full sentence: what blocks them", "headline": "one salient sentence about this buyer and what stops them",
+    "quote": "a verbatim quote of at most 160 characters from the run", "quote_run_id": "the run the quote comes from",
+    "model": "the id of the model that wrote this file"}
+_WORDS = {"persona": (1, 6), "headline": (8, 45), "goal": (5, 60), "problem": (5, 60), "quote": (3, 40)}
+_DANGLING = set("a an the and or but nor of to without because which who whose whom if than as into onto via per "
+                "their its my our your".split())  # words a finished sentence cannot end on
+_GENERIC_PERSONAS = {"other", "others", "misc", "miscellaneous", "general", "generic", "user", "users", "customer",
+                     "customers", "buyer", "buyers", "ungrouped", "unlabelled", "unlabeled", "unspecified"}
+_END = re.compile(r"[.!?][\"'\u201d\u2019)\]]*$")
+
+# the two statistics names are written so that they never appear spelled out in the source
+_BANNED = [(re.compile(p, re.I), label) for p, label in (
+    (r"ka{1}p{2}a", "stats jargon"), (r"co(?:h)en", "stats jargon"),
+    (r"p-value|confidence interval|standard deviation|chi-?square", "stats jargon"),
+    (r"\bunclear\b", "unclear"), (r"\bunknown\b", "unknown"), (r"\bn/a\b", "n/a"), (r"\bnan\b", "nan"),
+    (r"\bnone\b", "none"), (r"\bundefined\b", "undefined"), (r"\binf(?:inity)?\b", "infinity"),
+    (r"\bto-?do\b|\btbd\b|\bfixme\b", "todo"), (r"placeholder|lorem|ipsum", "placeholder"),
+    (r"\brepair|\bmistak|\bmislabel|\b(?:we|were|was|been)\s+(?:dropped|fixed|corrected|removed|excluded|discarded)\b"
+     r"|\b(?:dropped|removed|excluded|discarded)\s+\d", "repair wording"),
+    (r"\bsorry\b|apolog", "apology"), (r"\bunusable\b", "unusable"),
+    (r"/Us" r"ers/|/home/|/private/|/tmp/|\b[A-Za-z]:\\|\.jsonl?\b|\.csv\b|\bsign-?off\b|inputs_hash|\bPLITE_", "internal path"),
+    (r"\.\.\.|\u2026", "cut-off text"),
+    (r"\{\{|\}\}|\$\{|%\([A-Za-z_]+\)s|\$[A-Za-z_]{2,}", "unrendered placeholder"),
+    (r"(?<![$\d.])\d+\.\d{4,}|[-\u2212]0(?:\.0+)?%", "untidy number"))]
+
+
+def banned_hits(text):
+    """[(label, context)] for every forbidden wording in `text` (one per label)."""
+    res = []
+    for rx, label in _BANNED:
+        m = rx.search(text)
+        if m:
+            res.append((label, text[max(0, m.start() - 25):m.end() + 25].strip()))
+    return res
+
+
+def _fail(msg):
+    raise ProblemError("%s: %s" % (PROBLEM_FILE, msg))
+
+
+def _words_ok(field, text):
+    lo, hi = _WORDS[field]
+    n = len(text.split())
+    if not lo <= n <= hi:
+        _fail("'%s' has %d words; it needs %d to %d (%s)" % (field, n, lo, hi, _FIELD_HINT[field]))
+
+
+def _text_ok(field, text, sentence, brackets=True):
+    """Reject blank-looking, cut-off or junk text; `sentence` fields must be one complete sentence."""
+    _words_ok(field, text)
+    hits = banned_hits(text)
+    if hits:
+        _fail("'%s' contains %s (%r); rewrite it without" % (field, hits[0][0], hits[0][1]))
+    if brackets and re.search(r"[<>{}]", text):
+        _fail("'%s' contains template brackets; write plain text" % field)
+    letters = sum(ch.isalpha() for ch in text)
+    words = [w.lower() for w in text.split()]
+    if letters < 0.6 * len(text.replace(" ", "")) or len(set(words)) < min(len(words), max(3, len(words) // 2)):
+        _fail("'%s' reads like filler, not a real sentence; write it from the evidence" % field)
+    if not sentence:
+        return
+    if not _END.search(text):
+        _fail("'%s' does not end with . ! or ? (cut off?); write the full sentence" % field)
+    last = re.findall(r"[\w']+", text)[-1].lower()
+    if last in _DANGLING:
+        _fail("'%s' ends on '%s' (cut off?); write the full sentence" % (field, last))
+    if text.count("(") != text.count(")") or text.count('"') % 2 or text.count("\u201c") != text.count("\u201d"):
+        _fail("'%s' has an unclosed bracket or quote (cut off?); write the full sentence" % field)
+
+
+def _dossier_text(out, run_id):
+    """What was said in a run (ask, answer, tool inputs and outputs, errors), or None if the run has no dossier."""
+    needle = json.dumps(run_id)[1:-1]
+    for rel in (os.path.join("cig", "run_dossiers.jsonl"), os.path.join("normalized", "runs.jsonl")):
+        path = os.path.join(out, rel)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if needle not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(o, dict) and str(o.get("run_id")) == run_id:
+                    parts = [o.get("user_message"), o.get("final_answer")]
+                    for tc in o.get("tool_calls") or []:
+                        if isinstance(tc, dict):
+                            parts += [tc.get("args"), tc.get("result"), tc.get("error")]
+                    parts += o.get("errors") or []
+                    return " ".join("\n".join(p for p in parts if isinstance(p, str)).split())
+    return None
+
+
+def validate_problem(out, runs=None):
+    """Check scorecard_inputs/user_goal_problem.json against the data and return it with n and the fell-short share
+    computed here. Raises ProblemError (one line saying what to fix)."""
+    path = os.path.join(out, PROBLEM_FILE)
+    if not os.path.isfile(path):
+        _fail("is missing. Run the study step (study-init, then the study's last step that writes the user-goal "
+              "problem), then build the scorecard again")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        _fail("is not valid JSON; the study's problem step must write it again")
+    if not isinstance(d, dict):
+        _fail("must be a JSON object with persona, goal, problem, headline, quote, quote_run_id, run_ids and model")
+    f = {}
+    for k, hint in _FIELD_HINT.items():
+        v = d.get(k)
+        if not isinstance(v, str) or not v.strip():
+            _fail("'%s' is missing or blank; write %s" % (k, hint))
+        f[k] = " ".join(v.split())
+    _text_ok("persona", f["persona"], False)
+    if f["persona"].lower() in _GENERIC_PERSONAS:
+        _fail("'persona' is too generic; name the user-goal group (e.g. what they are there to do)")
+    for k in ("headline", "goal", "problem"):
+        _text_ok(k, f[k], True)
+    _text_ok("quote", f["quote"], False, brackets=False)
+    if len(f["quote"]) > 160:
+        _fail("'quote' is %d characters; it must be at most 160" % len(f["quote"]))
+    if redact(f["quote"]) != f["quote"]:
+        _fail("'quote' contains an e-mail address or a secret; pick another verbatim quote")
+    if not checks.gates_disabled() and not checks.model_allowed(f["model"]):
+        _fail("'model' %r is below the floor (Sonnet 5.5 or GPT 5.6 Terra, or better; never Haiku)" % f["model"])
+    ids = d.get("run_ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        _fail("'run_ids' must be a list of run id strings (every graded run in this user-goal group)")
+    ids = list(dict.fromkeys(i.strip() for i in ids if i.strip()))
+    label = {r["run_id"]: r["label"] for r in (scm.load_runs(out) if runs is None else runs)
+             if r["label"] in scm.LABELS}
+    stray = [i for i in ids if i not in label]
+    if stray:
+        _fail("'run_ids' has %d id(s) that are not graded, usable runs of this dataset (e.g. %s)"
+              % (len(stray), redact(stray[0])[:60]))
+    need = min(5, len(label))
+    if len(ids) < need:
+        _fail("'run_ids' lists %d run(s); a user-goal group needs at least %d" % (len(ids), need))
+    if f["quote_run_id"] not in ids:
+        _fail("'quote_run_id' must be one of 'run_ids'")
+    said = _dossier_text(out, f["quote_run_id"])
+    if said is None:
+        _fail("the run in 'quote_run_id' has no dossier to check the quote against")
+    if f["quote"] not in said:
+        _fail("'quote' is not found verbatim in the run in 'quote_run_id'; copy it exactly from that run")
+    split = {l: sum(1 for i in ids if label[i] == l) for l in scm.LABELS}
+    short = split["ambiguous"] + split["bad"]
+    if not short:
+        _fail("no run in 'run_ids' fell short of the goal; use the group with the most runs that fell short")
+    return dict(f, run_ids=ids, n=len(ids), split=split, fell_short_n=short,
+                fell_short_pct=scm.pct(short, len(ids)))
+
+
+# ------------------------------------------------------------ the page
+def shares(split):
+    """Whole-number percentage per outcome, adding up to 100."""
+    return dict(zip(scm.LABELS, round_shares([split[l] for l in scm.LABELS])))
+
+
+def stack(split, mini=False):
+    """One stacked bar of good / ambiguous / bad runs; with a percentage inside the wide segments."""
+    total, share = sum(split.values()), shares(split)
+    segs = "".join(
+        '<i class="%s" style="width:%.2f%%">%s</i>' % (
+            CLS[l], 100.0 * split[l] / total, "" if mini or split[l] * 11 < total else "%d%%" % share[l])
+        for l in scm.LABELS if split[l])
+    aria = "%s of %s" % (", ".join("%s %s" % (fmt_int(split[l]), l) for l in scm.LABELS), plural(total, "run"))
+    return '<div class="stack%s" role="img" aria-label="%s">%s</div>' % (" mini" if mini else "", E(aria), segs)
+
+
+def chart_split(split):
+    items, share = [], shares(split)
+    for l in scm.LABELS:
+        s = "<1%" if split[l] and not share[l] else "%d%%" % share[l]
+        items.append('<li class="%s"><b>%s</b>%s <span>%s</span></li>'
+                     % (CLS[l], E(s), NAME[l], E(plural(split[l], "run"))))
+    return stack(split) + '<ul class="legend">%s</ul>' % "".join(items)
+
+
+def chart_metrics(sc):
+    """Three small multiples (errors, run time, cost per run), each with one bar per outcome, from zero."""
+    unit = sc["unit"]
+    cost_name = {"usd": "Average cost per run", "tokens": "Average tokens per run",
+                 "calls": "Average tool calls per run"}[unit]
+    panels = (("Tool calls that failed", "error_pct", "pct", "no tool calls"),
+              ("Typical run time", "latency_median", "s", "no timings"),
+              (cost_name, "cost_mean", unit, "not recorded"))
+    out = []
+    for title, key, u, missing in panels:
+        top = max([sc["by"][l][key] for l in scm.LABELS if sc["by"][l][key] is not None] + [0])
+        rows = []
+        for l in scm.LABELS:
+            g, v = sc["by"][l], sc["by"][l][key]
+            if v is None:
+                bar, val = "", '<b class="val dim">%s</b>' % (E(missing) if g["n"] else "0 runs")
+            else:
+                bar = '<i class="%s" style="width:%.2f%%"></i>' % (CLS[l], 100.0 * v / top if top else 0)
+                val = '<b class="val">%s</b>' % show(u, v)[1]
+            rows.append('<li class="mrow"><span class="grp">%s<em>%s</em></span><span class="track">%s</span>%s</li>'
+                        % (NAME[l], E(plural(g["n"], "run")), bar, val))
+        out.append('<div class="panel"><h3>%s</h3><ul>%s</ul></div>' % (E(title), "".join(rows)))
+    return '<div class="panels">%s</div>' % "".join(out)
+
+
+def _r(o):
+    """Floats rounded for scorecard.json."""
+    if isinstance(o, float):
+        return round(o, 4)
+    if isinstance(o, dict):
+        return {k: _r(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_r(v) for v in o]
+    return o
+
+
+def make_page(sc, problem, claims, rows):
+    """-> (slots, data): ready-to-insert HTML per template slot, and scorecard.json (every number shown)."""
+    R = {r["key"]: r for r in rows}
+    g, c, e, l = R["goals"], R["cost"], R["errors"], R["latency"]
+    unit = c["unit"]
+    slots, shown = {}, {}
+
+    def put(name, text, markup=None):
+        shown[name] = text
+        slots[name] = E(text) if markup is None else markup
+
+    def put_value(name, u, v):
+        text, markup = show(u, v)
+        put(name, text, markup)
+
+    for r in rows:
+        put_value(r["key"] + "_x", r["unit"], r["x"])
+        put_value(r["key"] + "_y", r["unit"], r["y"])
+        put(r["key"] + "_delta", fmt_delta(r["delta_pct"]))
+    put_value("goals_now", "pct", round(100 - g["x"], 1))
+    put("goals_missed", fmt_int(g["graded"] - g["good"]))
+    put("goals_graded", fmt_int(g["graded"]))
+    put_value("errors_now", "pct", e["x"])
+    put("errors_failed", fmt_int(e["fails"]))
+    put("errors_calls", fmt_int(e["calls"]))
+    put_value("latency_now", "s", l["x"])
+    put("latency_median", NB.join(fmt_seconds(l["median"])))
+    put_value("cost_now", unit, c["x"])
+    total = {"usd": fmt_usd, "tokens": fmt_tokens, "calls": fmt_int}[unit](c["total"])
+    put("cost_total", total)
+    put("n_runs", plural(c["n"], "run"))
+    put("cost_caption", {"usd": "average cost of one run (%s across %s).",
+                         "tokens": "tokens used by an average run (%s across %s).",
+                         "calls": "tool calls in an average run (%s across %s)."}[unit] % (total, shown["n_runs"]))
+    kicker = "%s graded" % plural(sc["n_graded"], "run")
+    if sc["dates"] and fmt_dates(*sc["dates"]):
+        kicker += " \u00b7 " + fmt_dates(*sc["dates"])
+    put("kicker", kicker)
+    put("title", TITLE)
+    for k in ("persona", "headline", "goal", "problem", "quote"):
+        put(k, problem[k])
+    put("problem_n", fmt_int(problem["n"]))
+    put("problem_short_n", fmt_int(problem["fell_short_n"]))
+    put_value("problem_short_pct", "pct", problem["fell_short_pct"])
+    split = problem["split"]
+    slots["problem_bar"] = stack(split, mini=True) + '<p class="note">%s</p>' % E(
+        " \u00b7 ".join("%s %s" % (fmt_int(split[x]), x) for x in scm.LABELS))
+    slots["chart_split"] = chart_split(sc["split"])
+    slots["chart_metrics"] = chart_metrics(sc)
+    put("accuracy_gain_pct", fmt_num(claims["accuracy_gain_pct"]))
+    slots["url"] = E(claims["url"])
+    first, last = sc["dates"] or ("", "")
+    data = _r({
+        "title": TITLE,
+        "runs": {"usable": sc["n"], "graded": sc["n_graded"], "first_day": first, "last_day": last},
+        "tiles": {
+            "goals": {"not_reached_percent": round(100 - g["x"], 1), "not_reached": g["graded"] - g["good"], "graded": g["graded"]},
+            "errors": {"percent": e["x"], "failed_calls": e["fails"], "tool_calls": e["calls"],
+                       "definition": "failed tool calls divided by all tool calls"},
+            "latency": {"slowest_tenth_s": l["x"], "median_s": l["median"]},
+            "cost": {"unit": unit, "per_run": c["x"], "total": c["total"], "runs": c["n"]}},
+        "problem": {k: problem[k] for k in ("persona", "headline", "goal", "problem", "quote")} | {
+            "runs": problem["n"], "fell_short": problem["fell_short_n"],
+            "fell_short_pct": problem["fell_short_pct"], "outcomes": problem["split"]},
+        "system5": rows,
+        "outcomes": {k: {"runs": sc["split"][k], "percent": scm.pct(sc["split"][k], sc["n_graded"])}
+                     for k in scm.LABELS},
+        "by_outcome": {k: {"runs": v["n"], "error_pct": v["error_pct"], "median_latency_s": v["latency_median"],
+                           "cost_per_run": v["cost_mean"]} for k, v in sc["by"].items()},
+        "claims": claims,
+        "shown": shown})
+    return slots, data
+
+
+_SLOT = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
+
+
+def load_template(out):
+    for p in (os.path.join(out, "scorecard.template.html"), TEMPLATE):
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+    raise SystemExit("error: templates/scorecard.template.html is missing from the plugin")
+
+
+def fill(template, slots):
+    """Drop the template's own comments, then fill every known {{slot}}; unknown ones stay (and fail the lint)."""
+    t = re.sub(r"<!--.*?-->", "", template, flags=re.S)
+    t = _SLOT.sub(lambda m: slots.get(m.group(1), m.group(0)), t)
+    return re.sub(r"\n{3,}", "\n\n", t)
+
+
+# ------------------------------------------------------------ lint
+REQUIRED = ("pb-headline", "pb-goal", "pb-problem")
+_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
+
+class LintError(SystemExit, ValueError):
+    pass
+
+
+class _Scan(HTMLParser):
+    """Visible text (no <style> or <script>), titles and labels, comments, and the text of the required elements."""
+
+    def __init__(self, required):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.required, self.text, self.found, self.stack, self.skip, self.blank = required, [], {}, [], 0, 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        self.text += [a[k] for k in ("title", "alt", "aria-label") if a.get(k)]
+        if self.stack and tag != "br":
+            self.stack[-1]["kids"] += 1
+        if tag in ("style", "script"):
+            self.skip += 1
+        if tag not in _VOID:
+            self.stack.append({"tag": tag, "cls": (a.get("class") or "").split(), "text": [], "kids": 0})
+
+    def handle_endtag(self, tag):
+        if tag in ("style", "script"):
+            self.skip = max(0, self.skip - 1)
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i]["tag"] == tag:
+                for el in self.stack[i:]:
+                    txt = "".join(el["text"]).replace("\xa0", " ").strip()
+                    for c in el["cls"]:
+                        if c in self.required:
+                            self.found.setdefault(c, []).append(txt)
+                    if el["tag"] in ("td", "th") and not txt and not el["kids"]:
+                        self.blank += 1
+                del self.stack[i:]
+                break
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.text.append(data)
+            for el in self.stack:
+                el["text"].append(data)
+
+    def handle_comment(self, data):
+        self.text.append(data)
+
+
+def lint_hits(html_text, required=REQUIRED):
+    """Everything on the page that a customer must not see (list of short strings; empty = clean)."""
+    hits = []
+    for m in _SLOT.finditer(html_text):
+        hits.append("unrendered placeholder: {{%s}}" % m.group(1))
+    scan = _Scan(required)
+    scan.feed(html_text)
+    scan.close()
+    text = " ".join(" ".join(scan.text).split())
+    hits += ["%s: ...%s..." % hit for hit in banned_hits(text)]
+    if scan.blank:
+        hits.append("blank table cell (%d)" % scan.blank)
+    for c in required:
+        if c not in scan.found:
+            hits.append("missing element with class %s" % c)
+        elif not all(scan.found[c]):
+            hits.append("empty element with class %s" % c)
+    return hits
+
+
+def lint_customer_html(html_text, required=REQUIRED):
+    """Fail the build (LintError, a SystemExit) when the page holds forbidden wording, a blank cell, an unfilled slot or
+    an empty headline, goal or problem."""
+    hits = lint_hits(html_text, required)
+    if hits:
+        raise LintError("error: scorecard.html would show text a customer must not see: %s. Fix the source (the "
+                        "problem file, the template or the data) and build again." % "; ".join(hits[:6]))
+
+
+# ------------------------------------------------------------ build
+def _write(path, text):
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def clear_study(out):
+    """Delete the temporary <out>/study, only when it carries the marker study-init wrote."""
+    d = os.path.join(out, "study")
+    if os.path.isfile(os.path.join(d, STUDY_MARKER)) and not os.path.islink(d):
+        shutil.rmtree(d)
+
+
+def build(out, keep_study=False):
+    """gates -> validate_problem -> numbers -> page -> lint -> write -> delete the study. Returns scorecard.html."""
+    checks.require(out, GATES)
     sc = scm.compute(out)
     if not sc["n"]:
-        raise SystemExit("report: no runs found in %s (run `cig` first)"
-                         % os.path.join(out, "cig", "runs.csv"))
-    blocks, level = fit(sc)
-    md = os.path.join(out, "REPORT.md")
-    dx = os.path.join(out, "REPORT.docx")
-    with open(md, "w", encoding="utf-8") as f:
-        f.write(render_md(sc, blocks, template))
-    write_docx(dx, blocks)
-    info = check_pages(dx, blocks)
-    info.update(md=md, docx=dx, level=level, graded=sc["graded"])
-    return info
+        raise SystemExit("error: no usable runs in %s (build the CIG first)" % os.path.join(out, "cig", "runs.csv"))
+    if not sc["n_graded"]:
+        raise SystemExit("error: no graded runs (scores.csv has no outcome for any run); finish grading first")
+    problem = validate_problem(out, sc["runs"])
+    try:
+        claims = est.load_claims(out)
+        rows = est.system5(sc, claims)
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    slots, data = make_page(sc, problem, claims, rows)
+    page = fill(load_template(out), slots)
+    lint_customer_html(page)
+    _write(os.path.join(out, "scorecard.json"), json.dumps(data, indent=1, ensure_ascii=False) + "\n")
+    path = os.path.join(out, "scorecard.html")
+    _write(path, page)
+    if not keep_study:
+        clear_study(out)
+    return path
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="plite report", description="Write REPORT.md and REPORT.docx.")
+    ap = argparse.ArgumentParser(prog="plite report", description="Write scorecard.html and scorecard.json.")
     ap.add_argument("--out", default="./procept-out")
-    ap.add_argument("--template", default=None)
+    ap.add_argument("--keep-study", action="store_true", help="keep <out>/study after the build")
+    ap.add_argument("--validate-problem", action="store_true",
+                    help="only check scorecard_inputs/user_goal_problem.json")
     a = ap.parse_args(argv)
-    info = build(a.out, a.template)
-    print("wrote %s and %s" % (info["md"], info["docx"]))
-    print("pages: %s (%s)%s" % (info["pages"], info["method"],
-                                "" if info["graded"] else "; not graded yet"))
-    if info["pages"] > 1:
-        print("warning: report may exceed one page", file=sys.stderr)
+    try:
+        if a.validate_problem:
+            p = validate_problem(a.out)
+            print("ok: %s (%s, %d%% fell short)" % (p["persona"], plural(p["n"], "run"), round(p["fell_short_pct"])))
+        else:
+            print(os.path.abspath(build(a.out, a.keep_study)))
+    except SystemExit as e:
+        if not isinstance(e.code, str):
+            raise
+        print(e.code if e.code.startswith("error") else "error: " + e.code, file=sys.stderr)
+        return 2
     return 0
 
 
