@@ -34,14 +34,14 @@ Anything breaks, or the data will not load, even if you are a free user: email *
 Inside Claude Code:
 
 ```
-/plugin marketplace add <repo path or git url>
+/plugin marketplace add michaelvega/procept-lite
 /plugin install procept-lite@procept-marketplace
 ```
 
 Or from a shell:
 
 ```
-claude plugin marketplace add <repo path or git url>
+claude plugin marketplace add michaelvega/procept-lite
 claude plugin install procept-lite@procept-marketplace
 ```
 
